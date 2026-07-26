@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Trained checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Tokenizer + token caches
+tok.json
+*.npz
+
+# Downloaded corpora / eval prompts
+tinystories.txt
+TinyStories*.txt
+eval_prompts.yaml
+
+# Benchmark outputs / run logs
+*.json
+logs/

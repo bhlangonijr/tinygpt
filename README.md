@@ -1,0 +1,305 @@
+# tinyGPT
+
+**A tiny, trainable-from-scratch GPT for squeezing coherent English out of the
+fewest parameters possible.** tinyGPT is a small decoder-only transformer that
+learns from the [TinyStories](https://arxiv.org/abs/2305.07759) corpus and
+completes short children's stories. At ~10M parameters it trains from scratch in
+a couple of hours on a single consumer GPU (and runs, slowly, on CPU), which
+makes it a fast, honest sandbox for one question:
+
+> **How much quality can you get at a fixed, tiny parameter count — and what
+> levers move it?**
+
+Because a full training run is cheap, you can change *anything* — the data, the
+regularization, the optimizer, even the learning rule itself — and measure the
+effect end-to-end. tinyGPT ships with two trainers built for exactly that:
+
+- **`train.py`** — the standard backprop + AdamW trainer. The baseline you tune against.
+- **`train_sa.py`** — a **gradient-free** trainer that replaces backprop with directional
+  **simulated annealing**. A research variant: same model, no `loss.backward()` at all.
+
+The point of the small scale is reproducibility: an idea that helps (or doesn't)
+shows up clearly, and anyone can rerun it. Contributions of new levers are
+welcome — see [Contributing](#contributing).
+
+The model is a clean decoder-only transformer: byte-level BPE → token + position
+embeddings → a stack of (RMSNorm → causal self-attention → RMSNorm → GELU MLP)
+blocks with residual connections → a tied linear head. No biases. Attention uses
+PyTorch's fused `scaled_dot_product_attention` (flash when available). It
+descends from Andrej Karpathy's nanoGPT/minGPT line (see [Credits](#credits)).
+
+---
+
+## Quick start
+
+```bash
+# 1. install
+pip install -r requirements.txt
+
+# 2. get the training corpus (~2 GB; the validation file auto-downloads on first train)
+python download_tinystories.py
+
+# 3. train (writes microgpt_best.pt + microgpt_last.pt)
+python train.py                        # uses the GPU if there is one, else CPU
+CUDA_VISIBLE_DEVICES=0 python train.py # pick a specific GPU
+
+# 4. complete stories from the trained model
+python infer.py "once upon a time "
+python infer.py "the little robot "
+python infer.py                        # interactive: type a prompt, get a story
+
+# 5. benchmark it on the official TinyStories eval prompts
+python bench.py
+```
+
+For a fast smoke test, cap the corpus and shorten the run:
+
+```bash
+TARGET_CHARS=20000000 python download_tinystories.py   # ~20M-char slice
+# then lower max_steps in config.py (e.g. 2000) and run python train.py
+```
+
+---
+
+## What's happening (the pipeline)
+
+The code is small and split into focused modules. Reading them in this order is
+the fastest way in:
+
+1. **Corpus** (`data.py`, `config.py:clean`) — load TinyStories, split on the
+   `<|endoftext|>` story marker, lowercase + filter each story to a small ASCII
+   subset + collapse whitespace, and **keep the marker** so story boundaries
+   survive. Training uses the whole training file; validation uses a **separate
+   held-out file**, so val loss is a true out-of-sample estimate.
+2. **Byte-level BPE** (`data.py`) — train a byte-level BPE tokenizer (Rust
+   `tokenizers`) to `VOCAB_SIZE`, with `<|endoftext|>` reserved as an atomic
+   special token so no token ever straddles a story boundary. Encoded ids are
+   cached (`tok.json`, `bpe_cache*.npz`) so later runs start instantly.
+3. **Model** (`model.py`) — the transformer described above, processing a whole
+   `(batch, sequence)` in one forward pass. One definition, shared by every script.
+4. **Train** (`train.py` / `train_sa.py`) — sample random windows, compute
+   cross-entropy, update the weights (AdamW, or gradient-free SA), report train +
+   val loss and bits/char, and keep the best-val checkpoint.
+5. **Sample** (`infer.py`, `model.generate`) — encode a prompt and
+   autoregressively extend it, stopping at the `<|endoftext|>` boundary so you get
+   one clean story.
+6. **Benchmark** (`bench.py`) — score a checkpoint on the official TinyStories
+   evaluation prompts (perplexity, bits/char, generation-quality heuristics, and
+   an optional LLM judge).
+
+Story boundaries are learned, not hard-coded: the model emits `<|endoftext|>`
+when it thinks a story is done, and generation stops there.
+
+---
+
+## The two trainers
+
+Same model, same data, same evaluation — only the **learning rule** differs.
+
+| | `train.py` | `train_sa.py` |
+|---|---|---|
+| **Rule** | backprop + AdamW | directional **simulated annealing** (gradient-free) |
+| **Uses gradients?** | yes (`loss.backward()`) | **no** — forward passes only |
+| **Checkpoints** | `microgpt_best.pt` / `microgpt_last.pt` | `microgpt_sa_best.pt` / `microgpt_sa_last.pt` |
+| **Status** | production baseline | research experiment |
+
+### How the gradient-free trainer works
+
+`train_sa.py` never computes a gradient. Each step:
+
+1. Picks **one** weight tensor (a "local layer"). Probing one tensor at a time
+   keeps the measured loss change attributable to *that* tensor, so the
+   signal-to-noise ratio stays usable — a global all-tensor perturbation smears
+   one scalar Δloss across millions of parameters and collapses to a plateau.
+2. Evaluates the loss at **+noise** and **−noise** on that tensor (an *antithetic*
+   pair on the same batch) and forms a zeroth-order gradient estimate
+   `g = (L₊ − L₋) / (2·var)·noise`. It is unbiased and stays nonzero even on flat
+   regions, so the walk never freezes.
+3. Feeds that estimate into a per-tensor **credit** momentum (the descent
+   direction), takes a step along it, and **Metropolis-accepts** it against a
+   temperature `T` that **cools** over training.
+
+It converges far more slowly than backprop and is not expected to match it — it
+is here to make *the optimizer itself* a variable you can experiment with. Sample
+or benchmark it exactly like the backprop model (`python infer.py
+microgpt_sa_best.pt`, `python bench.py microgpt_sa_best.pt`) for a head-to-head.
+
+---
+
+## Files
+
+| File | Role |
+|---|---|
+| `config.py` | Shared knobs: architecture + training hyper-parameters + the `clean()` normalizer. One source of truth. |
+| `model.py` | The GPT model (RMSNorm, attention block, tied head), plus `generate()` and checkpoint save/load. Imported by everything. |
+| `data.py` | Corpus loading, byte-level BPE training/caching, held-out validation, batching. |
+| `train.py` | Backprop + AdamW trainer. |
+| `train_sa.py` | Gradient-free simulated-annealing trainer. |
+| `infer.py` | Story completion from any checkpoint (backprop or SA). |
+| `bench.py` | TinyStories eval-prompt benchmark: perplexity, bits/char, quality heuristics, optional LLM judge. |
+| `download_tinystories.py` | Fetch the TinyStories corpus from Hugging Face. |
+
+Checkpoints embed `n_head` (the one hyper-parameter not recoverable from the raw
+weights); `infer.py` / `bench.py` rebuild the exact architecture from the tensor
+shapes, so they adapt to whatever size you trained.
+
+---
+
+## Config knobs
+
+All in `config.py` (SA-specific knobs are at the top of `train_sa.py`).
+
+| Knob | Default | Controls |
+|---|---|---|
+| `VOCAB_SIZE` | `1024` | BPE vocab size (byte alphabet is 256, so go well above it). |
+| `n_layer` / `n_embd` / `n_head` | `6` / `356` / `4` | Depth / width / heads (`n_embd % n_head == 0`). These + `block_size` + `VOCAB_SIZE` fix the ~9.6M param count. |
+| `block_size` | `256` | Context length in tokens (~4–5 sentences). |
+| `dropout` | `0.1` | Regularization; raise to fight overfitting. Param-free. |
+| `batch_size` / `max_steps` | `128` / `50000` | Sequences per step / total steps. |
+| `lr` / `min_lr` / `warmup_steps` | `1e-3` / `1e-4` / `200` | Warmup → cosine-decay schedule. |
+| `weight_decay` | `0.1` | AdamW decay (matrices only; norms undecayed). Param-free. |
+| `MAX_CHARS` | `None` | Cap the corpus (chars); `None` = use it all. |
+| `eval_interval` / `eval_iters` | `250` / `50` | Steps between evals / batches per val estimate. |
+
+**Whenever you change the corpus, delete the tokenizer cache** so it rebuilds:
+
+```bash
+rm -f tok.json bpe_cache.npz bpe_cache_val.npz
+```
+
+(Changing `dropout` or model width does *not* require deleting the cache.)
+
+---
+
+## Reading the training output
+
+Each eval line prints `train`, `val`, and `bits/char`. Bits/char is normalized
+per character, so it is comparable across runs **on the same corpus**.
+
+- **Both falling, gap small and steady** → healthy; keep training or scale up.
+- **Train falling, val flat or rising, gap widening** → overfitting. Your best
+  model is the val minimum (captured automatically in `microgpt_best.pt`); steps
+  past it just memorize.
+- **Train and val flat together, small gap** → capacity-limited; add params.
+
+This is the loop the project runs on: push quality at a fixed size with the
+param-free levers (more data, dropout, weight decay, LR schedule, batch size),
+then decide whether the remaining gap is worth more parameters.
+
+---
+
+## Benchmarking
+
+`bench.py` scores a checkpoint on Eldan & Li's official TinyStories evaluation
+prompts (auto-downloaded on first run) and reports three things:
+
+```bash
+python bench.py                          # microgpt_best.pt, all prompts (offline metrics)
+python bench.py microgpt_sa_best.pt      # benchmark the SA model
+python bench.py --limit 8 --show 4       # quick look, print 4 completions
+python bench.py --judge                  # add the LLM-judge grades (needs ANTHROPIC_API_KEY)
+python bench.py --json scores.json       # also dump full per-prompt results
+```
+
+1. **Language modeling** — perplexity and bits/char of the prompt text under the
+   model. The principled, comparable number (lower is better). Prompts are
+   normalized with the trainer's `clean()` first so they match the training
+   distribution; pass `--raw` to skip that.
+2. **Generation quality** — the model continues each prompt and the continuation
+   is scored with offline heuristics aimed at this model's known failure modes:
+   repetition (`rep-n`), diversity (`distinct-n`), longest repeated-token run,
+   whether it emitted `<|endoftext|>` and stopped, and whether it ends on sentence
+   punctuation.
+3. **LLM judge** (`--judge`) — the paper-comparable signal. The official
+   TinyStories eval grades completions with a strong LLM on
+   grammar/creativity/consistency/plot; `--judge` reproduces that with Claude via
+   the `anthropic` SDK. The offline metrics are local proxies; this is the real one.
+
+---
+
+## Results
+
+**Reference (backprop, `train.py` at the default ~9.6M config):** trained on the
+full TinyStories corpus, a reference run reaches roughly **0.56 bits/char** on the
+held-out validation set and produces fluent, coherent short stories — named
+characters, simple dialogue, and a setup/conflict/resolution arc. That coherence
+emerges precisely because the *data's* complexity matches the model's *capacity*
+(the central TinyStories result). Exact numbers depend on corpus size, steps, and
+hardware; treat this as a ballpark to reproduce, not a fixed target.
+
+**Simulated annealing (`train_sa.py`):** a research variant. Gradient-free
+training converges much more slowly and is not expected to match backprop at
+equal steps; it is provided so the learning rule is something you can study and
+improve, not a competitive baseline. Benchmark it head-to-head with `bench.py`.
+
+---
+
+## Things to try
+
+- **Feed it your own text.** Point `INPUT_FILE` at any plain-text file with
+  `<|endoftext|>` between documents, delete the tokenizer cache, and retrain.
+- **Improve quality at fixed params.** More data, dropout, weight decay, a longer
+  cosine schedule, and a bigger batch all raise quality without changing the param
+  count — that is the core game here.
+- **Make it tiny / make it big.** Drop `n_layer`/`n_embd` for a bigram-soup model
+  in minutes, or scale up and watch the train-vs-val gap.
+- **Change the temperature.** Low (`0.3`) parrots common phrases; high (`1.2`)
+  goes surreal.
+- **Beat backprop's efficiency with the gradient-free trainer** — or find where it
+  plateaus and why.
+
+## Contributing
+
+tinyGPT is meant to be forked and experimented on. Good contributions:
+
+- A new **param-free quality lever** with a before/after `bench.py` comparison.
+- Improvements to the **gradient-free trainer** (better probes, schedules, credit rules).
+- New **evaluation metrics** or a stronger judging setup.
+- Reproductions at different sizes / corpora, with numbers.
+
+Keep the model definition in `model.py` singular and shared; keep new
+hyper-parameters in `config.py` (or, for optimizer-specific knobs, at the top of
+the relevant trainer). Include a `bench.py` result with any quality claim.
+
+---
+
+## Caveats
+
+- **Small-model failure modes are expected:** entity/coreference breakdown across
+  sentences, occasional repetition loops, and rare-word drift. They improve with
+  scale, more data, and sampling tweaks.
+- **CPU works but is slow.** The project assumes a single consumer GPU for a full
+  run; bf16/TF32 autocast enable automatically when the hardware supports them.
+- **bits/char is only comparable within a corpus.** Different corpora are different
+  rulers (TinyStories is intrinsically low-entropy).
+- **The offline generation-quality metrics are proxies.** Use `--judge` for the
+  paper-comparable grammar/creativity/consistency/plot signal.
+
+---
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+## Credits
+
+The model and training/inference scaffolding descend from
+[Andrej Karpathy](https://github.com/karpathy)'s nanoGPT / minGPT teaching GPTs
+(MIT), reworked with a PyTorch loop, byte-level BPE, a TinyStories pipeline, and a
+gradient-free training variant. Attributions are recorded in [`NOTICE`](NOTICE).
+
+## References
+
+- **TinyStories** — Eldan, R. & Li, Y. *TinyStories: How Small Can Language Models
+  Be and Still Speak Coherent English?* arXiv:2305.07759 (2023).
+  https://arxiv.org/abs/2305.07759 (`roneneldan/TinyStories` on Hugging Face)
+
+```bibtex
+@article{eldan2023tinystories,
+  author  = {Eldan, Ronen and Li, Yuanzhi},
+  title   = {TinyStories: How Small Can Language Models Be and Still Speak Coherent English?},
+  journal = {arXiv preprint arXiv:2305.07759},
+  year    = {2023},
+  url     = {https://arxiv.org/abs/2305.07759}
+}
+```

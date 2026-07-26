@@ -1,0 +1,14 @@
+# Core (required to train, infer, and benchmark)
+torch>=2.0
+tokenizers>=0.15
+numpy
+
+# Data download (download_tinystories.py)
+huggingface_hub
+
+# Optional: faster/robust eval-prompt parsing in bench.py (there is a built-in
+# fallback parser, so this is not strictly required)
+pyyaml
+
+# Optional: LLM-as-judge grading in `bench.py --judge` (needs ANTHROPIC_API_KEY)
+anthropic

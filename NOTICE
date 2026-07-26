@@ -1,0 +1,21 @@
+tinyGPT
+Copyright 2026 The tinyGPT authors
+
+Licensed under the Apache License, Version 2.0 (see the LICENSE file).
+
+-------------------------------------------------------------------------------
+Attributions
+-------------------------------------------------------------------------------
+
+The model and training/inference scaffolding are derived from Andrej Karpathy's
+nanoGPT / minGPT line of teaching GPTs
+(https://github.com/karpathy/nanoGPT, MIT License), reworked here with a PyTorch
+training loop, byte-level BPE tokenization, a TinyStories data pipeline, and a
+gradient-free (simulated-annealing) training variant, so the model can be
+trained from scratch to study quality at minimal parameter counts.
+
+The TinyStories corpus used for training and evaluation is from:
+
+  Eldan, R. and Li, Y. "TinyStories: How Small Can Language Models Be and Still
+  Speak Coherent English?" arXiv:2305.07759 (2023).
+  Dataset: roneneldan/TinyStories on Hugging Face.
