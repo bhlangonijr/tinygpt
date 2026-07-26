@@ -32,14 +32,19 @@ descends from Andrej Karpathy's nanoGPT/minGPT line (see [Credits](#credits)).
 
 ## Quick start
 
+This is the **complete pipeline** — the defaults run the *full* thing (the
+entire TinyStories corpus, the full training schedule). No extra flags needed.
+
 ```bash
 # 1. install
 pip install -r requirements.txt
 
-# 2. get the training corpus (~2 GB; the validation file auto-downloads on first train)
+# 2. download the FULL training corpus (~2.2 GB, the whole TinyStories V2 GPT-4 set).
+#    The held-out validation file auto-downloads on the first training run.
 python download_tinystories.py
 
-# 3. train (writes microgpt_best.pt + microgpt_last.pt)
+# 3. train the full model with the defaults in config.py
+#    (~9.6M params, whole corpus, 50k steps -> microgpt_best.pt + microgpt_last.pt)
 python train.py                        # uses the GPU if there is one, else CPU
 CUDA_VISIBLE_DEVICES=0 python train.py # pick a specific GPU
 
@@ -52,11 +57,35 @@ python infer.py                        # interactive: type a prompt, get a story
 python bench.py
 ```
 
-For a fast smoke test, cap the corpus and shorten the run:
+**What to expect.** Step 2 downloads ~2.2 GB. On the first `train.py` run the
+tokenizer is trained and the corpus is encoded + cached (`tok.json`,
+`bpe_cache*.npz`) — a few minutes on the full corpus, then instant on later runs.
+The full 50k-step run is roughly a couple of hours on a single modern consumer
+GPU (much slower on CPU). You'll see an eval line every `eval_interval` steps, and
+`*` marks a new best-val checkpoint:
+
+```
+vocab: 1024 | eot id: 1 | train tokens: ~500M | val tokens: ~5M | device: cuda | bf16: True
+params: 9,585,300
+--- training ---
+step      0 | train 6.93 | val 6.93 | ... bits/char | 3s *     # ~ln(vocab): untrained
+step    250 | train ...  | val ...  | ... bits/char | ...s *
+...
+```
+
+(The initial loss is ≈`ln(vocab)` ≈ 6.93 by construction; token counts and the
+loss trajectory depend on the corpus and hardware. See [Results](#results) for the
+ballpark a full run reaches.)
+
+### Fast smoke test
+
+To verify the pipeline end-to-end in minutes instead of hours, cap the corpus and
+shorten the run:
 
 ```bash
-TARGET_CHARS=20000000 python download_tinystories.py   # ~20M-char slice
-# then lower max_steps in config.py (e.g. 2000) and run python train.py
+TARGET_CHARS=20000000 python download_tinystories.py   # ~20M-char slice instead of 2.2 GB
+# then lower max_steps in config.py (e.g. 2000) and run:
+python train.py
 ```
 
 ---
