@@ -23,16 +23,21 @@ from config import (clean, EOT, INPUT_FILE, VAL_FILE, VAL_URL, TOK_FILE,
                     CACHE_FILE, VAL_CACHE_FILE, VOCAB_SIZE, ENCODE_CHUNK_CHARS)
 
 
-def _encode_corpus(tok, text):
+def _encode_corpus(tok, text, label='corpus'):
     """Encode `text` in chunks so the Rust encoder stays memory-friendly.
 
     One small int32 array per chunk, concatenated at the end -- a single Python
     list of every id would be ~28 B/int and blow up to tens of GB at multi-GB
-    corpus scale; int32 arrays are ~4 B/id.
+    corpus scale; int32 arrays are ~4 B/id. Prints a running char counter so a
+    multi-GB encode never looks stalled.
     """
     parts = []
-    for i in range(0, len(text), ENCODE_CHUNK_CHARS):
+    n = len(text)
+    for i in range(0, n, ENCODE_CHUNK_CHARS):
         parts.append(np.asarray(tok.encode(text[i:i + ENCODE_CHUNK_CHARS]).ids, dtype=np.int32))
+        print(f"  encoding {label}: {min(i + ENCODE_CHUNK_CHARS, n):,} / {n:,} chars", end='\r', flush=True)
+    if n:
+        print()   # finish the \r progress line
     return np.concatenate(parts) if parts else np.empty(0, dtype=np.int32)
 
 
@@ -41,7 +46,7 @@ def load_data():
     chars_per_token, train_data, val_data (both CPU int16 tensors)."""
     # --- training tokens + tokenizer, trained on the training text only ---
     if os.path.exists(TOK_FILE) and os.path.exists(CACHE_FILE):
-        print("loading cached tokenizer + train ids...")
+        print("loading cached tokenizer + train ids...", flush=True)
         tok  = Tokenizer.from_file(TOK_FILE)
         blob = np.load(CACHE_FILE)
         train_ids, train_cpt = blob['ids'], float(blob['cpt'])
@@ -50,33 +55,43 @@ def load_data():
             raise FileNotFoundError(
                 f"Expected training corpus at {INPUT_FILE!r}. "
                 f"Run `python download_tinystories.py` first.")
+        # First-run, one-time work (all cached afterward). Each step is announced
+        # BEFORE it starts, with flush=True, so the multi-GB corpus never looks stalled.
+        print(f"first run: preparing tokenizer + token cache (one-time; several "
+              f"minutes on the full corpus, then reused).", flush=True)
+        print(f"  reading + normalizing {INPUT_FILE!r} ...", flush=True)
         text = clean(open(INPUT_FILE, encoding='utf-8', errors='ignore').read())
-        print(f"train corpus: {len(text):,} chars | training BPE to {VOCAB_SIZE}...")
+        print(f"  corpus: {len(text):,} chars | training byte-level BPE to vocab "
+              f"{VOCAB_SIZE} (this is the slow one-time step) ...", flush=True)
         tok = Tokenizer(models.BPE())
         tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
         tok.decoder       = decoders.ByteLevel()
         tr = trainers.BpeTrainer(vocab_size=VOCAB_SIZE, special_tokens=[EOT],
-                                 initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
+                                 initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                                 show_progress=True)
         chunks = (text[i:i + ENCODE_CHUNK_CHARS] for i in range(0, len(text), ENCODE_CHUNK_CHARS))
         tok.train_from_iterator(chunks, tr)
-        train_ids = _encode_corpus(tok, text)
+        print("  BPE trained. encoding the corpus to token ids ...", flush=True)
+        train_ids = _encode_corpus(tok, text, label='train')
         train_cpt = len(text.replace(EOT, '')) / len(train_ids)   # exclude marker chars -> bits/char stays comparable
         tok.save(TOK_FILE)
         np.savez(CACHE_FILE, ids=train_ids, cpt=train_cpt)
+        print(f"  cached: {TOK_FILE} + {CACHE_FILE} (next run skips all of the above).", flush=True)
 
     # --- held-out validation tokens (separate file, never seen in training) ---
     if os.path.exists(VAL_CACHE_FILE):
-        print("loading cached val ids...")
+        print("loading cached val ids...", flush=True)
         vblob = np.load(VAL_CACHE_FILE)
         val_ids, val_cpt = vblob['ids'], float(vblob['cpt'])
     else:
         if not os.path.exists(VAL_FILE):
-            print(f"val file {VAL_FILE!r} not found -- downloading...")
+            print(f"val file {VAL_FILE!r} not found -- downloading...", flush=True)
             import urllib.request
             urllib.request.urlretrieve(VAL_URL, VAL_FILE)
+        print(f"  reading + normalizing {VAL_FILE!r} ...", flush=True)
         vtext = clean(open(VAL_FILE, encoding='utf-8', errors='ignore').read())
-        print(f"val corpus:   {len(vtext):,} chars | encoding...")
-        val_ids = _encode_corpus(tok, vtext)
+        print(f"  val corpus: {len(vtext):,} chars | encoding ...", flush=True)
+        val_ids = _encode_corpus(tok, vtext, label='val')
         val_cpt = len(vtext.replace(EOT, '')) / len(val_ids)
         np.savez(VAL_CACHE_FILE, ids=val_ids, cpt=val_cpt)
 

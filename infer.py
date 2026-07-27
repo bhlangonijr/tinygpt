@@ -21,7 +21,7 @@ import sys
 import torch
 from tokenizers import Tokenizer
 
-from config import TOK_FILE, EOT, n_head as CFG_N_HEAD
+from config import TOK_FILE, EOT, n_head as CFG_N_HEAD, clean
 from model import load_checkpoint
 
 # ---------------- inference knobs ----------------
@@ -54,7 +54,15 @@ print(f"loaded {CKPT}: vocab {cfg.vocab_size} | n_embd {cfg.n_embd} | n_layer {c
 
 
 def sample(prompt, max_new=MAX_NEW, temperature=TEMPERATURE, top_k=TOP_K, stop=STOP_AT_EOT):
-    idx = torch.tensor([tok.encode(prompt).ids], dtype=torch.long, device=device)
+    # Normalize the prompt exactly like the training corpus (lowercase, charset
+    # filter, strip). This matches the trainer/bench and, crucially, removes any
+    # TRAILING space: with byte-level BPE a leading space attaches to the NEXT
+    # word, so a dangling trailing space is an out-of-distribution token that
+    # glitches the first generated token (a stray "-", a "-year-old" fragment...).
+    ids = tok.encode(clean(prompt)).ids
+    if not ids:                                # prompt normalized to nothing -> nothing to condition on
+        return ''
+    idx = torch.tensor([ids], dtype=torch.long, device=device)
     with torch.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
         out = model.generate(idx, max_new, temperature=temperature, top_k=top_k,
                              eot_id=eot_id, stop=stop)

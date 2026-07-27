@@ -48,9 +48,10 @@ python download_tinystories.py
 python train.py                        # uses the GPU if there is one, else CPU
 CUDA_VISIBLE_DEVICES=0 python train.py # pick a specific GPU
 
-# 4. complete stories from the trained model
-python infer.py "once upon a time "
-python infer.py "the little robot "
+# 4. complete stories from the trained model (prompts are auto-normalized to
+#    match training: lowercased, charset-filtered, whitespace-trimmed)
+python infer.py "once upon a time"
+python infer.py "the little robot"
 python infer.py                        # interactive: type a prompt, get a story
 
 # 5. benchmark it on the official TinyStories eval prompts

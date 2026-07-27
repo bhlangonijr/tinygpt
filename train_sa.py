@@ -40,7 +40,7 @@ import time
 import torch
 
 from config import (seed, block_size, batch_size, dropout, n_layer, n_embd,
-                    n_head, max_steps, eval_interval, eval_iters)
+                    n_head, max_steps, eval_interval, eval_iters, clean)
 from data import load_data, make_get_batch
 from model import build_model, save_checkpoint
 
@@ -171,8 +171,8 @@ save_checkpoint(model, 'microgpt_sa_last.pt', n_head)
 
 # ---------------- sample ----------------
 print("--- inference ---")
-for p in ["once upon a time ", "the little ", "one day ", "lily and tom ", "the big dog "]:
-    idx = torch.tensor([encode(p)], dtype=torch.long, device=device)
+for p in ["once upon a time", "the little", "one day", "lily and tom", "the big dog"]:
+    idx = torch.tensor([encode(clean(p))], dtype=torch.long, device=device)
     with torch.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
         out = model.generate(idx, max_new=120, temperature=0.8, top_k=40, eot_id=eot_id)
     print(f"[{p!r}] -> {decode(out[0].tolist())}")
