@@ -25,7 +25,7 @@ from config import TOK_FILE, EOT, n_head as CFG_N_HEAD, clean
 from model import load_checkpoint
 
 # ---------------- inference knobs ----------------
-MAX_NEW     = 200
+MAX_NEW     = 300         # headroom so most stories reach <|endoftext|> on their own
 TEMPERATURE = 0.7
 TOP_K       = 40
 
@@ -53,6 +53,16 @@ print(f"loaded {CKPT}: vocab {cfg.vocab_size} | n_embd {cfg.n_embd} | n_layer {c
       f"| block {cfg.block_size} | n_head {cfg.n_head} | device {device}", file=sys.stderr)
 
 
+def _trim_to_sentence(text):
+    """If the text doesn't already end on sentence punctuation, cut back to the
+    last one so a story that hit the token cap doesn't dangle mid-word."""
+    t = text.rstrip()
+    if not t or t.endswith(('.', '!', '?', '"', '”', '’')):
+        return t
+    cut = max(t.rfind('.'), t.rfind('!'), t.rfind('?'))
+    return t[:cut + 1] if cut != -1 else t
+
+
 def sample(prompt, max_new=MAX_NEW, temperature=TEMPERATURE, top_k=TOP_K, stop=STOP_AT_EOT):
     # Normalize the prompt exactly like the training corpus (lowercase, charset
     # filter, strip). This matches the trainer/bench and, crucially, removes any
@@ -66,7 +76,11 @@ def sample(prompt, max_new=MAX_NEW, temperature=TEMPERATURE, top_k=TOP_K, stop=S
     with torch.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
         out = model.generate(idx, max_new, temperature=temperature, top_k=top_k,
                              eot_id=eot_id, stop=stop)
-    return tok.decode(out[0].tolist())         # decode drops EOT (skip_special_tokens=True)
+    text = tok.decode(out[0].tolist())         # decode drops EOT (skip_special_tokens=True)
+    # In the default (stop-on-EOT) mode, tidy the ending: a story that stopped on
+    # <|endoftext|> already ends cleanly (no-op), but one that hit the token cap is
+    # trimmed to its last complete sentence. --no-stop returns the raw text.
+    return _trim_to_sentence(text) if stop else text
 
 
 if prompts:
