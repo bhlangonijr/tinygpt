@@ -267,6 +267,34 @@ occasional semantic slips (an object used out of context, a coreference that
 drifts across sentences). These shrink with scale/data, not with sampling
 tweaks.
 
+**Benchmark (`bench.py`, all 44 official TinyStories eval prompts).** Scoring
+that same checkpoint (`python bench.py --judge`, sampling `T=0.7 top_k=40
+max_new=200`):
+
+| Metric | Value | Notes |
+|---|---|---|
+| perplexity | 5.54 | on the eval-prompt text |
+| bits/char | 0.682 | > the 0.506 val above — expected: hand-written, out-of-distribution openings, normalized over short prompts |
+| distinct-1 / -2 | 0.51 / 0.79 | diversity (higher is better) |
+| repetition 2 / 3 / 4 | 0.21 / 0.11 / 0.06 | looping (lower is better) |
+| mean longest run | 1.0 tokens | no token-level loops |
+| stopped on `<|endoftext|>` | 86% | learned the story boundary |
+| ends cleanly | 86% | ends on sentence punctuation |
+| heuristic quality (offline proxy) | 86.3 / 100 | — |
+
+LLM-judge grades (Claude, 1–10, all 44 completions graded):
+
+| grammar | creativity | consistency | plot |
+|---|---|---|---|
+| 7.45 | 3.95 | 4.91 | 4.55 |
+
+This is the characteristic tiny-model profile: **grammar is essentially solved**
+(fluent surface, no repetition loops, clean story stops), while
+creativity/consistency/plot sit around 4–5 — the global-coherence ceiling of a
+~10M-param model (the judge flags things like an object used out of context or a
+coreference that drifts). Those three axes are capacity/data-bound, not
+sampling-bound, so they are the interesting targets to move.
+
 **Simulated annealing (`train_sa.py`):** a research variant. Gradient-free
 training converges much more slowly and is not expected to match backprop at
 equal steps; it is provided so the learning rule is something you can study and
