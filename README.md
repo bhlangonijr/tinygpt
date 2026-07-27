@@ -61,22 +61,24 @@ python bench.py
 **What to expect.** Step 2 downloads ~2.2 GB. On the first `train.py` run the
 tokenizer is trained and the corpus is encoded + cached (`tok.json`,
 `bpe_cache*.npz`) — a few minutes on the full corpus, then instant on later runs.
-The full 50k-step run is roughly a couple of hours on a single modern consumer
-GPU (much slower on CPU). You'll see an eval line every `eval_interval` steps, and
-`*` marks a new best-val checkpoint:
+The full 50k-step run takes roughly **2.7 hours on a single bf16-capable consumer
+GPU** (much slower on CPU). You'll see an eval line every `eval_interval` steps,
+and `*` marks a new best-val checkpoint. A real run looks like:
 
 ```
-vocab: 1024 | eot id: 1 | train tokens: ~500M | val tokens: ~5M | device: cuda | bf16: True
+vocab: 1024 | eot id: 0 | train tokens: 653,798,038 | val tokens: 6,597,993 | chars/token: 3.32 | device: cuda | bf16: True
 params: 9,585,300
 --- training ---
-step      0 | train 6.93 | val 6.93 | ... bits/char | 3s *     # ~ln(vocab): untrained
-step    250 | train ...  | val ...  | ... bits/char | ...s *
-...
+step      0 | train 6.9601 | val 6.9586 | 3.020 bits/char | 12s *      # ~ln(vocab): untrained
+step    250 | train 2.8836 | val 2.8880 | 1.253 bits/char | 61s *
+step  20000 | train 1.2745 | val 1.2769 | 0.554 bits/char | 3953s *
+step  49500 | train 1.1676 | val 1.1662 | 0.506 bits/char | 9757s *    # best-val checkpoint
+step  49999 | train 1.1648 | val 1.1721 | 0.509 bits/char | 9855s
 ```
 
-(The initial loss is ≈`ln(vocab)` ≈ 6.93 by construction; token counts and the
-loss trajectory depend on the corpus and hardware. See [Results](#results) for the
-ballpark a full run reaches.)
+(The initial loss ≈ `ln(vocab)` ≈ 6.93 by construction. Exact numbers depend on
+the corpus and hardware; the figures above are from one full run — see
+[Results](#results).)
 
 ### Fast smoke test
 
@@ -249,13 +251,21 @@ python bench.py --json scores.json       # also dump full per-prompt results
 
 ## Results
 
-**Reference (backprop, `train.py` at the default ~9.6M config):** trained on the
-full TinyStories corpus, a reference run reaches roughly **0.56 bits/char** on the
-held-out validation set and produces fluent, coherent short stories — named
-characters, simple dialogue, and a setup/conflict/resolution arc. That coherence
-emerges precisely because the *data's* complexity matches the model's *capacity*
-(the central TinyStories result). Exact numbers depend on corpus size, steps, and
-hardware; treat this as a ballpark to reproduce, not a fixed target.
+**Reference (backprop, `train.py` at the default 9,585,300-param config):**
+trained on the full TinyStories corpus (~654M training tokens, vocab 1024,
+`block_size=256`, 50k steps at batch 128), a full run reaches a best held-out
+**val loss of 1.166 → 0.506 bits/char** in ~2.7 h on one bf16-capable consumer
+GPU. It produces fluent, coherent short stories — named characters, simple
+dialogue, and a setup/conflict/resolution arc, stopping cleanly on
+`<|endoftext|>`. That coherence emerges precisely because the *data's* complexity
+matches the model's *capacity* (the central TinyStories result). Exact numbers
+depend on corpus size, steps, and hardware; treat this as a ballpark to
+reproduce, not a fixed target.
+
+Expected small-model artifacts remain at this scale: local fluency with
+occasional semantic slips (an object used out of context, a coreference that
+drifts across sentences). These shrink with scale/data, not with sampling
+tweaks.
 
 **Simulated annealing (`train_sa.py`):** a research variant. Gradient-free
 training converges much more slowly and is not expected to match backprop at
