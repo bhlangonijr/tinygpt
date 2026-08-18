@@ -28,3 +28,6 @@ eval_prompts.yaml
 # Benchmark outputs / run logs
 *.json
 logs/
+
+# Spectral experiment outputs (summaries, telemetry, figures)
+runs/

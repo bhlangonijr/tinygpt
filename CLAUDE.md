@@ -11,12 +11,15 @@ at a fixed, tiny parameter count**, and which levers move it. A full run is chea
 (a couple of hours on one consumer GPU), so end-to-end experiments are the unit
 of work. Read `README.md` for the framing and reproduction details.
 
-There are two trainers over the **same** model and data — the only variable is
+There are three trainers over the **same** model and data — the only variable is
 the learning rule:
 
 - `train.py` — backprop + AdamW (the baseline).
 - `train_sa.py` — gradient-free **directional simulated annealing** (research
   variant; forward passes only, no `loss.backward()`).
+- `train_spectral.py` — backprop, but the optimizer's persistent state (SGD
+  momentum / Adam `m`, `v`) is stored as `K` DCT coefficients per weight matrix
+  instead of one fp32 per parameter. Library lives in `spectral/`.
 
 ## Architecture (one model, shared everywhere)
 
@@ -54,6 +57,13 @@ python train_sa.py                      # -> microgpt_sa_best.pt / microgpt_sa_l
 python infer.py "once upon a time "     # complete a story (any checkpoint via first .pt arg)
 python bench.py                         # TinyStories eval-prompt benchmark
 python bench.py --judge                 # + LLM-judge grades (needs ANTHROPIC_API_KEY)
+
+# spectral optimizer-state experiment (see README for the full story)
+python spectral_selftest.py             # correctness gate -- run this FIRST
+python spectral_probe.py --scale micro  # is optimizer state compressible at all? (go/no-go)
+python train_spectral.py --opt adamw --state dense --scale micro --name adamw_dense
+python train_spectral.py --sweep experiments/mvp_screen.jsonl
+python spectral_report.py runs/ --plots
 ```
 
 There is no local torch-free validation path; changes to model/training logic are
@@ -76,3 +86,27 @@ verified by actually running a short training job (lower `max_steps` in
 - The repo is public and Apache-2.0 licensed; keep it self-contained (no
   environment-specific or private references) and update `NOTICE` if you add a
   third-party derivation.
+
+## The spectral experiment (`spectral/`, `*_spectral*.py`)
+
+- **The spec is `.specs/spectral-optimizer-state.md`** and its section numbers are
+  cited in code comments (`# spec section 15`). Never renumber sections — append.
+  When behaviour deviates from the spec, record it in the spec's deviations
+  section (41) rather than letting the two drift apart.
+- **`spectral_selftest.py` is the gate.** It asserts that with every coefficient
+  retained (`K = N`) the spectral optimizers reproduce `torch.optim.SGD` /
+  `torch.optim.AdamW` exactly. If that breaks, a compressed run is measuring a
+  bug rather than compression — fix it before trusting any quality number.
+- **Instrumented mode must never change the trajectory.** Shadow dense states
+  exist only to measure; the capacity controller runs on the same proxy spectrum
+  in both modes, so an instrumented run and its perf twin take the same path.
+  Instrumented runs are not valid memory benchmarks and are flagged as such.
+- **The second moment uses `T(g²)`, not `T(g)²`.** The latter would redefine Adam
+  in coefficient space instead of approximating real Adam state.
+- Transform-agnostic by construction: STFT (spec sections 7/10/11) drops in
+  behind the `Transform` interface in `spectral/transforms.py`. Cross-transform
+  comparisons must be in **bytes**, not coefficient counts — a complex STFT
+  coefficient costs two fp32s.
+- Spectral knobs live in `SpectralConfig` (`spectral/optim.py`) and are surfaced
+  as `train_spectral.py` flags — the same "experiment knobs stay with the
+  experiment" rule as `train_sa.py`.
