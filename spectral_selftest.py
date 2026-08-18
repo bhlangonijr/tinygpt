@@ -20,7 +20,8 @@ import sys
 
 import torch
 
-from spectral.metrics import jaccard_churn, k_required, spectral_entropy, energy_profile
+from spectral.metrics import (energy_profile, jaccard_churn, k_required, spectral_entropy,
+                             state_error, update_fidelity)
 from spectral.optim import SpectralAdamW, SpectralConfig, SpectralSGD
 from spectral.state import KController
 from spectral.transforms import DCT2D, dct, dct2, idct, idct2
@@ -106,8 +107,11 @@ def test_metrics():
 
     a = torch.tensor([1, 2, 3, 4])
     b = torch.tensor([3, 4, 5, 6])
-    churn, n_new = jaccard_churn(a, b)
-    check("Jaccard churn", abs(churn - (1 - 2 / 6)) < 1e-12 and n_new == 2)
+    churn, n_new, n_gone = jaccard_churn(a, b)
+    check("Jaccard churn", abs(churn - (1 - 2 / 6)) < 1e-12 and n_new == 2 and n_gone == 2)
+    grow = jaccard_churn(torch.tensor([0, 1, 2]), torch.tensor([0, 1, 2, 3, 4]))
+    check("pure growth evicts nothing", grow[1] == 2 and grow[2] == 0,
+          f"activated {grow[1]}, evicted {grow[2]}")
 
     ctrl = KController(k_min=10, k_max=100, shrink_ratio=0.75, patience=3)
     check("grows immediately", ctrl.update(60) == 60)
@@ -193,32 +197,96 @@ def test_truncation():
     print("truncated behaviour")
     shapes = [(32, 32)]
     grads = _grad_stream(shapes, 30, seed=11)
-    ref = _run(lambda g: torch.optim.AdamW([{'params': g[0]['params'], 'weight_decay': 0.0}],
-                                           lr=0.01, betas=(0.9, 0.95)), shapes, grads, True, 0.0)
+
+    # SGD first: no second-moment denominator, so this isolates truncation alone.
+    ref = _run(lambda g: torch.optim.SGD([{'params': g[0]['params']}], lr=0.01, momentum=0.9),
+               shapes, grads, True, 0.0)
     errs = []
     for frac in (0.01, 0.1, 0.5, 1.0):
-        out = _run(lambda g, f=frac: SpectralAdamW(
-            g, lr=0.01, betas=(0.9, 0.95), weight_decay=0.0,
+        out = _run(lambda g, f=frac: SpectralSGD(
+            g, lr=0.01, momentum=0.9,
             cfg=SpectralConfig(state='dct', selection='topk', kmax_frac=f, kmin_frac=f,
                                dynamic=False, refresh=1, telemetry_interval=10 ** 9)),
             shapes, grads, True, 0.0)
         errs.append(rel(out[0], ref[0]))
-    check("more coefficients -> closer to dense AdamW", all(a > b for a, b in zip(errs, errs[1:])),
+    check("SGD-M: more coefficients -> closer to dense", all(a > b for a, b in zip(errs, errs[1:])),
           " > ".join(f"{e:.2e}" for e in errs))
 
-    # DCT-Low keeps a deterministic prefix, so its active set never churns
-    params = [torch.nn.Parameter(torch.randn(32, 32, dtype=torch.float64) * 0.02)]
-    opt = SpectralSGD(_groups(params, ['blocks.0.fc.weight'], True, 0.0), lr=0.01, momentum=0.9,
-                      cfg=SpectralConfig(state='dct', selection='low', kmax_frac=0.25,
-                                         kmin_frac=0.01, refresh=1, telemetry_interval=10 ** 9))
-    for t in range(30):
-        params[0].grad = torch.randn(32, 32, dtype=torch.float64)
-        opt.step()
-    s = opt.state[params[0]]['m']
-    check("DCT-Low active set never churns", s.mean_churn == 0.0 and s.n_reset_coeff == 0,
-          f"mean churn {s.mean_churn:.3f}, reactivated {s.n_reset_coeff}")
-    check("dynamic K stayed within [K_min, K_max]", s.ctrl.k_min <= s.k <= s.ctrl.k_max,
-          f"K={s.k} in [{s.ctrl.k_min}, {s.ctrl.k_max}]")
+    # AdamW is tested on the quantity the experiment actually measures (sections
+    # 19-20): reconstruction error of the state, and fidelity of the update it
+    # produces, at a realistic state. A 30-step trajectory would instead be
+    # dominated by the section-15 denominator collapse, whose blow-up is checked
+    # separately below and is not monotone in K.
+    ref = _run(lambda g: torch.optim.AdamW([{'params': g[0]['params'], 'weight_decay': 0.0}],
+                                           lr=0.01, betas=(0.9, 0.95)), shapes, grads, True, 0.0)
+    dense_opt_params = [torch.nn.Parameter(torch.randn(32, 32, dtype=torch.float64) * 0.02)]
+    dense_opt = SpectralAdamW(_groups(dense_opt_params, ['blocks.0.fc.weight'], True, 0.0),
+                              lr=0.01, betas=(0.9, 0.95),
+                              cfg=SpectralConfig(state='dense', telemetry_interval=10 ** 9))
+    for step_grads in grads:
+        dense_opt_params[0].grad = step_grads[0].clone()
+        dense_opt.step()
+    st = dense_opt.state[dense_opt_params[0]]
+    m_d, v_d, t = st['m'], st['v'], st['t']
+    bc1, bc2, eps = 1 - 0.9 ** t, 1 - 0.95 ** t, 1e-8
+    u_dense = (m_d / bc1) / ((v_d / bc2).sqrt() + eps)
+
+    def truncate(x, k):
+        c = dct2(x).reshape(-1)
+        keep = torch.zeros_like(c)
+        i = c.abs().topk(k).indices
+        keep[i] = c[i]
+        return idct2(keep.view_as(x))
+
+    m_err, v_err, cos = [], [], []
+    for frac in (0.01, 0.05, 0.25, 1.0):
+        k = max(1, int(frac * m_d.numel()))
+        m_h, v_h = truncate(m_d, k), truncate(v_d, k).clamp_min(0.0)
+        m_err.append(state_error(m_d, m_h))
+        v_err.append(state_error(v_d, v_h))
+        cos.append(update_fidelity(u_dense, (m_h / bc1) / ((v_h / bc2).sqrt() + eps))[0])
+    check("AdamW: m reconstruction error falls with K",
+          all(a > b for a, b in zip(m_err, m_err[1:])), " > ".join(f"{e:.3f}" for e in m_err))
+    check("AdamW: v reconstruction error falls with K",
+          all(a > b for a, b in zip(v_err, v_err[1:])), " > ".join(f"{e:.3f}" for e in v_err))
+    check("AdamW: update cosine rises with K", all(a < b for a, b in zip(cos, cos[1:])),
+          " < ".join(f"{c:.4f}" for c in cos))
+    print(f"  [--] H2 observation at K/N=5%: m error {m_err[1]:.3f} vs v error {v_err[1]:.3f} "
+          f"({'m' if m_err[1] < v_err[1] else 'v'} compresses better here)")
+
+    # DCT-Low's real invariant: the active set is always a PREFIX of the fixed
+    # low-frequency order. Growing K therefore adds coefficients without ever
+    # displacing one, so no history is destroyed -- but churn is still nonzero
+    # while K grows, because the set genuinely changed.
+    def churn_run(selection, **kw):
+        params = [torch.nn.Parameter(torch.randn(32, 32, dtype=torch.float64) * 0.02)]
+        opt = SpectralSGD(_groups(params, ['blocks.0.fc.weight'], True, 0.0),
+                          lr=0.01, momentum=0.9,
+                          cfg=SpectralConfig(state='dct', selection=selection, kmax_frac=0.25,
+                                             refresh=1, telemetry_interval=10 ** 9, **kw))
+        g = torch.Generator().manual_seed(5)
+        for _ in range(30):
+            params[0].grad = torch.randn(32, 32, generator=g, dtype=torch.float64)
+            opt.step()
+        return opt, opt.state[params[0]]['m']
+
+    _, low = churn_run('low', kmin_frac=0.01)
+    prefix = low.order[:low.k].sort().values
+    check("DCT-Low active set is always a prefix of the fixed order",
+          bool(torch.equal(low.idx, prefix)) and low.n_evicted == 0,
+          f"K={low.k}, activated {low.n_activated}, evicted {low.n_evicted}")
+
+    _, fixed = churn_run('low', kmin_frac=0.25)
+    check("DCT-Low at fixed K never churns at all",
+          fixed.mean_churn == 0.0 and fixed.n_activated == 0 and fixed.n_evicted == 0,
+          f"mean churn {fixed.mean_churn:.3f}")
+
+    _, top = churn_run('topk', kmin_frac=0.25)
+    check("TopK at fixed K does churn, and evicts history", top.n_evicted > 0,
+          f"mean churn {top.mean_churn:.3f}, evicted {top.n_evicted} vs Low 0")
+    check("dynamic K stayed within [K_min, K_max]", low.ctrl.k_min <= low.k <= low.ctrl.k_max,
+          f"K={low.k} in [{low.ctrl.k_min}, {low.ctrl.k_max}]")
+    opt, _ = churn_run('low', kmin_frac=0.01)
     mem = opt.memory_report()
     check("DCT-Low stores no indices", mem['persistent_state_bytes'] < mem['dense_equivalent_bytes'],
           f"{mem['persistent_state_bytes']}B vs dense {mem['dense_equivalent_bytes']}B "

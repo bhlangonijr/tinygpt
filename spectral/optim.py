@@ -174,7 +174,7 @@ class _SpectralBase(torch.optim.Optimizer):
             'step': st['t'], 'tensor': st.get('name', ''), 'state': label, 'n': n,
             'k_current': s.k, 'k_max': kmax,
             'k_cur_over_n': s.k / n, 'k_cur_over_kmax': s.k / kmax,
-            'churn': st.get(f'churn_{label}', ''),
+            'churn': st.get(f'churn_{label}', ''), 'evicted_cum': s.n_evicted,
             'k_req_proxy': proxy if proxy is not None else '',
         }
         if shadow is not None:
@@ -248,7 +248,7 @@ class _SpectralBase(torch.optim.Optimizer):
     def spectral_summary(self):
         """Aggregate active-set behaviour over the whole run."""
         acc = {'k_over_n': [], 'occupancy': [], 'churn': [], 'cap_hit': []}
-        resets = 0
+        activated = evicted = 0
         for group in self.param_groups:
             for p in group['params']:
                 st = self.state.get(p, {})
@@ -260,10 +260,12 @@ class _SpectralBase(torch.optim.Optimizer):
                     acc['occupancy'].append(s.k / s.ctrl.k_max)
                     acc['churn'].append(s.mean_churn)
                     acc['cap_hit'].append(s.ctrl.cap_hit_rate)
-                    resets += s.n_reset_coeff
+                    activated += s.n_activated
+                    evicted += s.n_evicted
         mean = lambda xs: (sum(xs) / len(xs)) if xs else None
         out = {f'{k}_mean': mean(v) for k, v in acc.items()}
-        out['reactivated_coefficients'] = resets
+        out['activated_coefficients'] = activated
+        out['evicted_coefficients'] = evicted      # the section-16 history loss
         out['phase_seconds_sampled'] = dict(self.phase)
         out['phase_sample_steps'] = self.phase_samples
         return out

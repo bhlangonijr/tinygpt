@@ -31,6 +31,19 @@ import torch
 EPS = 1e-12
 
 
+def _flat(x):
+    """Flatten for measurement WITHOUT changing precision.
+
+    Optimizer state is fp32 in real runs, so this is a no-op there. It matters
+    for the fp64 checks in `spectral_selftest.py`: a blanket `.float()` would
+    silently downcast them and cap every precision assertion at ~1e-7, which
+    turns an exact identity (retained energy predicts L2 truncation error) into
+    an apparent failure. Only sub-fp32 dtypes are promoted.
+    """
+    x = x.reshape(-1)
+    return x if x.dtype in (torch.float32, torch.float64) else x.float()
+
+
 # ---------------- capacity (spec sections 9, 10) ----------------
 def energy_profile(coeff, order=None):
     """Cumulative energy fraction along a selection order.
@@ -39,7 +52,7 @@ def energy_profile(coeff, order=None):
     energy captured by the first k+1 coefficients in the order. `order=None`
     means "sort by descending magnitude" (the TopK policy).
     """
-    e = coeff.reshape(-1).float().pow(2)
+    e = _flat(coeff).pow(2)
     if order is None:
         e, _ = torch.sort(e, descending=True)
     else:
@@ -79,7 +92,7 @@ def spectral_entropy(coeff):
     a threshold-free effective coefficient count, so it says how many modes
     matter without committing to a particular `tau`.
     """
-    e = coeff.reshape(-1).float().pow(2)
+    e = _flat(coeff).pow(2)
     total = float(e.sum())
     n = e.numel()
     if total <= EPS or n < 2:
@@ -103,7 +116,7 @@ def update_fidelity(u, u_hat):
     The spec's central fidelity triple: reconstruction error of the STATE is not
     enough, because what actually moves the weights is the UPDATE.
     """
-    a, b = u.reshape(-1).float(), u_hat.reshape(-1).float()
+    a, b = _flat(u), _flat(u_hat)
     na = float(torch.linalg.vector_norm(a))
     nb = float(torch.linalg.vector_norm(b))
     cos = float(torch.dot(a, b)) / (na * nb + 1e-12)
@@ -133,15 +146,22 @@ def negative_v_stats(v_hat):
 
 # ---------------- active-set stability (spec section 16) ----------------
 def jaccard_churn(old_sorted, new_sorted):
-    """`1 - |A n B| / |A u B|` for two sorted index sets.
+    """Returns `(churn, n_activated, n_evicted)` for two sorted index sets.
 
-    High churn means retained modes keep changing, so the optimizer history
-    stored in dropped coefficients is being thrown away and rebuilt from zero.
+    `churn = 1 - |A n B| / |A u B|` is the spec's section-16 metric, but on its
+    own it conflates two very different events. Simply GROWING K activates
+    coefficients that were never held before -- they have no history to lose, so
+    the resulting churn is the controller working as intended. EVICTING a
+    coefficient discards accumulated optimizer state, and only that is the loss
+    section 16 is about. The two counts are returned separately so a report can
+    tell a growing representation apart from an unstable one.
     """
     if old_sorted.numel() == 0 or new_sorted.numel() == 0:
-        return 1.0, 0
+        return 1.0, int(new_sorted.numel()), int(old_sorted.numel())
     pos = torch.searchsorted(old_sorted, new_sorted).clamp_max(old_sorted.numel() - 1)
     hit = old_sorted[pos] == new_sorted
     inter = int(hit.sum())
     union = old_sorted.numel() + new_sorted.numel() - inter
-    return 1.0 - inter / max(union, 1), int(new_sorted.numel() - inter)
+    return (1.0 - inter / max(union, 1),
+            int(new_sorted.numel() - inter),        # activated (new or returning)
+            int(old_sorted.numel() - inter))        # evicted: history actually destroyed

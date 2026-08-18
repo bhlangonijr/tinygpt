@@ -26,7 +26,7 @@ COLUMNS = [
     'k_current', 'k_required', 'k_max',
     'k_cur_over_n', 'k_req_over_n', 'k_cur_over_kmax', 'k_req_over_kmax',
     'retained_energy', 'residual_energy_at_kmax', 'excess_over_n',
-    'spectral_entropy', 'k_eff_over_n', 'churn',
+    'spectral_entropy', 'k_eff_over_n', 'churn', 'evicted_cum',
     'recon_error',
     'update_cosine', 'update_rel_norm', 'update_rel_err',
     'neg_v_frac', 'neg_v_energy', 'max_neg_v', 'v_clamp_frac',

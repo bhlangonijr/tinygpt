@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Status** | MVP implemented (sections 37 steps 1–9, DCT only). Not yet run. |
+| **Status** | MVP implemented (section 37 steps 1–9, DCT only). Correctness gate passing; step 4 probe run — **premise fails at micro scale**, see section 42. |
 | **Implementation** | `spectral/`, `train_spectral.py`, `spectral_probe.py`, `spectral_selftest.py`, `spectral_report.py` |
 | **Reconciliation** | Sections 40–42 map this document to the code and record every deviation |
 | **Testbed** | tinyGPT (this repo): one shared model, TinyStories, bits/char on a held-out file |
@@ -456,11 +456,22 @@ fraction_v_clamped
 Substantial negativity means the spectral approximation of `v` is structurally
 poor even when its global reconstruction error looks acceptable.
 
-**Numerical warning.** Clamping at exactly zero collapses the AdamW denominator
-to `eps`, making the update `|m_hat| / 1e-8`. A heavily truncated run can
-therefore diverge within a few steps. That divergence is a real property of the
-approximation and must not be hidden; a positive floor may be substituted to keep
-a run alive for study, but doing so changes the rule and must be reported.
+**Numerical warning — now measured, not hypothesized.** Clamping at exactly zero
+collapses the AdamW denominator to `eps`, making the update `|m_hat| / 1e-8`. A
+heavily truncated run does not merely approximate badly; it diverges within a few
+steps. `spectral_selftest.py` asserts this directly: at `K/N = 0.01`, parameters
+reach `>1e3` times their dense magnitude, and the resulting trajectory error is
+not even monotone in `K`, because it is measuring blow-up rather than
+approximation.
+
+Consequences for the experiment:
+
+* Truncation quality for AdamW must be assessed on **state reconstruction error
+  and update fidelity** (sections 19–20), not on how far a trajectory drifted.
+* A run that uses a positive floor has changed the update rule and must be
+  reported as such. The screening matrix uses `v_floor = 1e-8` (roughly two
+  orders of magnitude below a typical `v` at this scale) and keeps one
+  spec-literal `v_floor = 0` run as the control that demonstrates the collapse.
 
 ---
 
@@ -1046,8 +1057,10 @@ Each was a deliberate choice; each is reversible by a flag.
 2. **Newly activated coefficients keep the current step's gradient
    contribution** (`seed_new_from_grad`, default on). Section 16's history loss
    is preserved and measured: a re-activated coefficient still arrives with no
-   accumulated past, and `churn` / `reactivated_coefficients` count every such
-   event. What it does not additionally lose is the present step. Zero-filling
+   accumulated past. Additions and removals are counted **separately**
+   (`activated_coefficients`, `evicted_coefficients`), because churn alone
+   conflates them: simply growing `K` activates coefficients that never had
+   history to lose, and only an eviction destroys accumulated state. What it does not additionally lose is the present step. Zero-filling
    would discard fresh gradient information as well as old history and would
    confound churn with an implementation choice.
 
@@ -1065,13 +1078,63 @@ Each was a deliberate choice; each is reversible by a flag.
 
 ## 42. Verification status
 
-| Claim | How verified |
+| Claim | Status |
 |---|---|
-| DCT matches an explicit orthonormal DCT matrix; round-trip exact; Parseval holds; retained energy predicts L2 truncation error | Verified numerically against an independent numpy port (agreement to ~1e-14; error prediction to 1e-16) |
-| K controller grows immediately, holds in-band, shrinks only after `H` refreshes, clamps at `K_max`, damps oscillation | Verified by executing `KController` directly |
-| `K = N` spectral SGD ≡ `torch.optim.SGD`; `K = N` spectral AdamW ≡ `torch.optim.AdamW`; dense fallback path exact | **Asserted by `spectral_selftest.py`, not yet executed** |
-| Everything else (training loop, telemetry, memory accounting, report) | **Not executed** |
+| DCT matches an explicit orthonormal DCT matrix; round-trip exact; Parseval holds; retained energy predicts L2 truncation error | **Passing** on GPU host (`3.19e-15` vs the matrix reference) |
+| `K = N` spectral SGD ≡ `torch.optim.SGD` | **Passing** (`6.21e-16`) |
+| `K = N` spectral AdamW ≡ `torch.optim.AdamW`, incl. m-only and the dense fallback | **Passing** (`3.64e-13`) |
+| K controller: grows now, holds in-band, shrinks after `H`, clamps, damps oscillation | **Passing** |
+| Truncation monotonicity, DCT-Low prefix invariant, section-15 divergence | **Passing** after the test corrections recorded below |
+| Training loop, telemetry, memory accounting, report generator | **Not yet executed** |
 
-The equivalence assertions are the ones that matter: if they fail, every quality
-number downstream measures a bug rather than compression. Run
-`spectral_selftest.py` before trusting anything else here.
+The equivalence row is the one that matters: it establishes that in a compressed
+run, truncation is the *only* difference from dense training. It passes, so
+downstream quality numbers measure compression rather than a bug.
+
+### Corrections made after the first selftest execution
+
+1. **Measurement precision bug.** `spectral/metrics.py` downcast every input to
+   fp32, silently capping the fp64 checks at ~1e-7 and making an exact identity
+   (retained energy predicts L2 truncation error) appear to fail. Real runs use
+   fp32 state, so this never affected training — but it would have degraded every
+   reported metric's precision. Fixed: only sub-fp32 dtypes are promoted.
+2. **Churn conflated growth with instability** (see section 41, item 2).
+3. **Two tests asserted things the design never claimed**: monotone trajectory
+   convergence for AdamW under a rule that diverges (section 15), and zero churn
+   for DCT-Low under a *dynamic* `K` — growing `K` necessarily changes the active
+   set. Replaced with the invariants that do hold: the DCT-Low active set is
+   always a prefix of the fixed order and evicts nothing while growing; at fixed
+   `K` it never churns at all, while TopK does.
+
+### Results to date
+
+**Section 37 step 4 (the go/no-go probe), micro scale, 3,000 steps, one seed.**
+`K_required/N` at `tau = 0.99`, meaned over 16 eligible tensors and 12 probe
+points:
+
+| state | dct_topk | dct_low | identity_topk | dct_shuffled |
+|---|---:|---:|---:|---:|
+| g | 0.717 | 0.989 | 0.670 | 0.735 |
+| m | 0.729 | 0.989 | 0.695 | 0.735 |
+| v | 0.431 | 0.893 | 0.739 | 0.650 |
+
+This meets two of section 34's failure criteria for the first moment:
+`dct_topk ≈ dct_shuffled` (destroying spatial adjacency costs nothing) and
+`identity_topk < dct_topk` (the state's own coordinates are more compact than its
+DCT). In bytes — the only fair comparison, since TopK stores a 4-byte index per
+4-byte value — AdamW state becomes **9.27 B/param against 8.00 dense (1.16x
+worse)** with TopK, or 7.53 B/param (0.94x) with Low, against a section-35 target
+of 0.50x.
+
+H1 also fails: `m` (0.729) is no more compressible than raw `g` (0.717), so
+momentum's temporal averaging does not concentrate the spectrum.
+
+**H2 is reversed.** The second moment is the *easier* one under DCT (0.431), and
+it is the only state where the transform beats both controls in both directions
+— evidence of genuine spatial structure, consistent with `g^2` being
+non-negative and carrying a large low-frequency component. Its ceiling is still
+only ~14% state savings, well under the bar.
+
+Caveats: micro scale (192-wide matrices), early training, single seed, one `tau`.
+Scale may move the magnitudes; it is unlikely to reverse the within-tensor
+shuffle and identity controls.

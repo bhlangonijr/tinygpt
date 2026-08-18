@@ -94,8 +94,83 @@ def analyze(s, dct):
     return rows
 
 
+def summarize(path):
+    """Slice an existing probe.csv -- no training, no GPU.
+
+    The headline table the probe prints at the end is one number per
+    (state, basis) at tau=0.99. That is enough to decide go/no-go, but not
+    enough to understand a result, so this reads the whole file back and asks
+    the three follow-up questions the spec cares about: how sensitive is the
+    answer to tau (section 9), does required capacity move during training
+    (Q2 / section 31), and does it vary by tensor?
+
+    The last table is the one that decides anything, because coefficient counts
+    are not comparable across policies: DCT-Low stores 4 bytes per retained
+    coefficient and needs no indices, while any TopK policy stores a 4-byte
+    value AND a 4-byte index. Sections 7 and 22 require the comparison to be in
+    bytes, against the 4 bytes per parameter a dense fp32 state costs.
+    """
+    rows = list(csv.DictReader(open(path)))
+    if not rows:
+        print(f"{path}: empty")
+        return
+    steps = sorted({int(r['step']) for r in rows})
+    mean = lambda xs: sum(xs) / len(xs) if xs else float('nan')
+
+    def sel(**kw):
+        out = rows
+        for k, v in kw.items():
+            out = [r for r in out if r[k] == str(v)]
+        return out
+
+    states = [s for s in ('g', 'm', 'v') if sel(state=s)]
+
+    print(f"\n== K_required / N by reconstruction target ==")
+    print(f"  {'state':<6} {'tau':>6} " + " ".join(f"{b:>15}" for b in BASES))
+    for st in states:
+        for tau in TAUS:
+            cells = [f"{mean([float(r['k_req_over_n']) for r in sel(state=st, basis=b, tau=tau)]):>15.4f}"
+                     for b in BASES]
+            print(f"  {st:<6} {tau:>6} " + " ".join(cells))
+
+    print(f"\n== evolution of K_required / N (tau=0.99, dct_topk) -- does capacity move? ==")
+    print(f"  {'state':<6} " + " ".join(f"{s:>8}" for s in steps))
+    for st in states:
+        cells = [f"{mean([float(r['k_req_over_n']) for r in sel(state=st, basis='dct_topk', tau=0.99, step=s)]):>8.3f}"
+                 for s in steps]
+        print(f"  {st:<6} " + " ".join(cells))
+
+    print(f"\n== K_required / N by tensor kind (tau=0.99, dct_topk) ==")
+    kinds = sorted({r['tensor'].split('.')[-2] for r in rows})
+    print(f"  {'state':<6} " + " ".join(f"{k:>10}" for k in kinds))
+    for st in states:
+        cells = [f"{mean([float(r['k_req_over_n']) for r in sel(state=st, basis='dct_topk', tau=0.99) if r['tensor'].split('.')[-2] == k]):>10.3f}"
+                 for k in kinds]
+        print(f"  {st:<6} " + " ".join(cells))
+
+    print(f"\n== residual energy left unrepresented at a fixed budget (tau-free) ==")
+    cols = [f'resid_at_{int(f * 100)}pct' for f in RESID_FRACS]
+    print(f"  {'state':<6} {'basis':<15} " + " ".join(f"{c.replace('resid_at_', 'K='):>10}" for c in cols))
+    for st in states:
+        for b in BASES:
+            got = sel(state=st, basis=b, tau=0.99)
+            print(f"  {st:<6} {b:<15} " + " ".join(f"{mean([float(r[c]) for r in got]):>10.4f}" for c in cols))
+
+    print(f"\n== bytes per parameter of persistent state (dense fp32 = 4.00) ==")
+    print(f"  {'state':<6} {'basis':<15} {'K/N':>8} {'B/param':>9} {'vs dense':>9}")
+    for st in states:
+        for b in BASES:
+            k = mean([float(r['k_req_over_n']) for r in sel(state=st, basis=b, tau=0.99)])
+            per = 4 if b == 'dct_low' else 8      # deterministic prefix needs no stored indices
+            print(f"  {st:<6} {b:<15} {k:>8.3f} {k * per:>9.2f} {k * per / 4:>8.2f}x")
+    print("\n  A ratio >= 1.00 means the compressed representation costs more than the dense\n"
+          "  state it replaces. Spec section 35 wants <= 0.50.")
+
+
 def main():
     p = argparse.ArgumentParser(description="offline optimizer-state compressibility probe")
+    p.add_argument('--analyze', default=None,
+                   help='summarize an existing probe.csv and exit (no training)')
     p.add_argument('--scale', choices=list(SCALES), default='micro')
     p.add_argument('--steps', type=int, default=3000)
     p.add_argument('--probe-interval', type=int, default=250)
@@ -107,6 +182,8 @@ def main():
     p.add_argument('--name', default='probe')
     p.add_argument('--out', default='runs')
     a = p.parse_args()
+    if a.analyze:
+        return summarize(a.analyze)
 
     out_dir = os.path.join(a.out, a.name)
     os.makedirs(out_dir, exist_ok=True)

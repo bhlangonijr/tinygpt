@@ -75,7 +75,8 @@ class SpectralState:
         self.coef = torch.zeros(self.idx.numel(), device=device, dtype=dtype)
         self.total_churn = 0.0
         self.n_refresh = 0
-        self.n_reset_coeff = 0                   # coefficients that came back with no history
+        self.n_activated = 0                     # coefficients added (new capacity or returning)
+        self.n_evicted = 0                       # coefficients dropped -- history genuinely lost
 
     # ---------------- the linear recursion (spec sections 13, 14) ----------------
     def accumulate(self, coeff_dense_flat, decay, alpha):
@@ -97,9 +98,10 @@ class SpectralState:
     def reselect(self, ref_dense_flat, k, seed=None):
         """Move to a `k`-coefficient active set chosen from `ref_dense_flat`.
 
-        Surviving coefficients keep their accumulated value. A newly activated
-        coefficient has no history -- that loss is real and is counted in
-        `n_reset_coeff` and in the churn metric. What it does NOT have to lose
+        Surviving coefficients keep their accumulated value. Coefficients that
+        LEAVE the set lose theirs for good; that is the section-16 loss, counted
+        in `n_evicted` (additions are counted separately in `n_activated`,
+        because growing K destroys nothing). What it does NOT have to lose
         is the CURRENT step: `seed` (this step's transformed gradient
         contribution) initializes new coefficients to the value they would have
         had if they had been active for exactly this one step. Without it, a
@@ -112,7 +114,7 @@ class SpectralState:
         else:
             new_idx = torch.topk(ref_dense_flat.abs(), k, sorted=False).indices
         new_idx = new_idx.sort().values.contiguous()
-        churn, n_new = jaccard_churn(self.idx, new_idx)
+        churn, n_new, n_gone = jaccard_churn(self.idx, new_idx)
         if k == self.idx.numel() and n_new == 0:
             self.n_refresh += 1
             return 0.0
@@ -125,7 +127,8 @@ class SpectralState:
         self.idx, self.coef = new_idx, new_coef
         self.total_churn += churn
         self.n_refresh += 1
-        self.n_reset_coeff += n_new
+        self.n_activated += n_new
+        self.n_evicted += n_gone
         return churn
 
     # ---------------- accounting (spec section 22) ----------------
