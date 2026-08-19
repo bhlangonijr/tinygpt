@@ -255,14 +255,22 @@ def fidelity_rows(m, v, t, dct, betas=(0.9, 0.95), eps=1e-8):
             at_floor = float((v_h == v_h.min()).float().mean()) if policy != 'clamp0' \
                 else float((v_h == 0).float().mean())
             v_err = state_error(v, v_h)
-            for variant, mm in (('v_only', m), ('both', m_h)):
+            # Two controls, and they are the point of this table. `v_scalar` replaces the
+            # whole second moment with one number (its mean) -- if that scores as well as
+            # a K-coefficient DCT, the transform is earning nothing at the update level,
+            # exactly as identity_topk showed for the energy criterion. `v_floor_only`
+            # applies the floor WITHOUT truncating, isolating what the floor alone costs.
+            v_scalar = floored(torch.full_like(v, float(v.mean())), policy)
+            v_nofloor = floored(v, policy)
+            for variant, mm, vv in (('v_only', m, v_h), ('both', m_h, v_h),
+                                    ('v_scalar', m, v_scalar), ('v_floor_only', m, v_nofloor)):
                 cos, rnorm, rerr = update_fidelity(
-                    u_dense, (mm / bc1) / ((v_h / bc2).sqrt() + eps))
+                    u_dense, (mm / bc1) / ((vv / bc2).sqrt() + eps))
                 rows.append({'n': m.numel(), 'budget': f, 'variant': variant, 'floor': policy,
                              'update_cosine': cos, 'update_rel_norm': rnorm, 'update_rel_err': rerr,
                              'm_recon_err': m_err if variant == 'both' else '',
-                             'v_recon_err': v_err, 'v_neg_frac': neg['neg_frac'],
-                             'v_at_floor': at_floor})
+                             'v_recon_err': v_err if variant in ('v_only', 'both') else '',
+                             'v_neg_frac': neg['neg_frac'], 'v_at_floor': at_floor})
     return rows
 
 
@@ -299,6 +307,17 @@ def print_fidelity(rows):
         print(f"  {f * 100:>4.0f}% " + " ".join(cells)
               + f" {mean([float(x['v_neg_frac']) for x in r]):>10.4f}"
               + f" {mean([float(x['v_at_floor']) for x in r]):>11.4f}")
+
+    ctrl_floor = 'abs1e-8'
+    print(f"\n  controls at floor={ctrl_floor} -- is the DCT earning anything at the update level?")
+    print(f"  {'K/N':>5} {'v_only (K coeffs)':>19} {'v_scalar (1 number)':>21} "
+          f"{'v_floor_only (no trunc)':>25}")
+    for f in FID_BUDGETS:
+        vals = [mean([x['update_cosine'] for x in pick(f, var, ctrl_floor)])
+                for var in ('v_only', 'v_scalar', 'v_floor_only')]
+        print(f"  {f * 100:>4.0f}% {vals[0]:>19.4f} {vals[1]:>21.4f} {vals[2]:>25.4f}")
+    print("  v_scalar does not depend on K. If v_only never beats it, the spectral")
+    print("  representation of the second moment is decoration.")
 
     print("\n  clamp0 is spec section 15 as written. If its cosine is far below the floored\n"
           "  variants and its |u|/|u*| is huge, the metric is reporting the eps singularity\n"

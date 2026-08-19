@@ -1231,6 +1231,37 @@ literal), an absolute floor, and a floor at a thousandth of the reconstruction's
 own mean (deployable, since for an orthonormal DCT the mean is the DC
 coefficient) — and reports cosine and relative norm for each.
 
+**Second measurement, with floors. The result is flat in `K`:**
+
+| floor | 1% | 5% | 10% | 25% |
+|---|---:|---:|---:|---:|
+| `clamp0` (spec literal) | 0.233 | 0.209 | 0.187 | 0.188 |
+| floor ≈ 1e-9 (`rel1e-3`) | 0.730 | 0.664 | 0.650 | 0.682 |
+| floor = 1e-8 (`abs1e-8`) | 0.952 | 0.947 | 0.946 | 0.956 |
+
+Across that range the reconstruction of `v` improves 4.5x (residual energy
+0.140 → 0.031) and the update cosine does not move. It is monotone in the
+**floor** and flat in **K**. So update fidelity here is not a function of how
+well the second moment is reconstructed at all — it is a function of how the
+small values are handled.
+
+**This is the mechanism behind the whole negative result, and it is not specific
+to the DCT.** Coefficient energy is dominated by `v`'s *large* entries, which any
+L2-optimal truncation reproduces first. But AdamW divides by `sqrt(v)`, so the
+update is governed by `v`'s *small* entries — precisely where a truncated
+reconstruction rings, and precisely where relative error is largest. The
+section-9 retained-energy criterion is therefore the **wrong objective for a
+second moment**: it optimizes accuracy where the optimizer is least sensitive.
+Any future attempt at compressing `v` needs a relative-error or log-domain
+criterion, not an energy one.
+
+Two controls were added to test whether the transform contributes anything at
+the update level at all: `v_scalar` replaces the entire second moment with a
+single number (its mean), and `v_floor_only` applies the floor without
+truncating. `v_scalar` is `K`-independent by construction, so if `v_only` does
+not beat it, the spectral representation is decoration — the same question
+`identity_topk` answered for the energy criterion.
+
 Caveats: micro scale (192-wide matrices), early training, single seed. Scale may
 move the magnitudes; it is unlikely to reverse the within-tensor shuffle and
 identity controls, which compare a tensor against itself.
