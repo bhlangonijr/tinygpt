@@ -1,0 +1,29 @@
+# The convergence arm: does loss return to dense as K -> N, and at what memory cost?
+# Run with:  python train_spectral.py --sweep experiments/highk_curve.jsonl
+#
+# The main screen (mvp_screen.jsonl) capped K_max at 25% of N and, because the controller
+# was under-provisioning, never actually exceeded ~13%. That leaves the interesting region
+# unmeasured. Every run here uses --fixed-k so K is pinned exactly at the stated fraction:
+# no controller, so the x-axis means what it says.
+#
+# Two things this pins down. First, the identity: at K/N = 1.0 the spectral optimizer is
+# algebraically AdamW (spectral_selftest.py asserts it to 3.6e-13), so that run must
+# reproduce the dense control's loss -- an end-to-end check of the whole pipeline, not
+# just the optimizer in isolation. Second, the trap: DCT-TopK stores 4 bytes of value plus
+# 4 bytes of index per retained coefficient, so it costs the same as dense state at
+# K/N = 50% and MORE above it. The probe says m needs K/N = 73% to hold 99% of its energy.
+# If loss only returns to dense past the break-even point, the method has no operating
+# region -- which is exactly what the low-K quality numbers imply.
+#
+# ~3 min per run at micro scale.
+{"name": "curve_topk_k025", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.25, "fixed_k": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "curve_topk_k050", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.50, "fixed_k": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "curve_topk_k075", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.75, "fixed_k": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "curve_topk_k100", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 1.00, "fixed_k": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "curve_low_k025", "opt": "adamw", "state": "dct", "select": "low", "kmax_frac": 0.25, "fixed_k": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "curve_low_k050", "opt": "adamw", "state": "dct", "select": "low", "kmax_frac": 0.50, "fixed_k": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "curve_low_k075", "opt": "adamw", "state": "dct", "select": "low", "kmax_frac": 0.75, "fixed_k": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "curve_low_k100", "opt": "adamw", "state": "dct", "select": "low", "kmax_frac": 1.00, "fixed_k": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+# K = N with the spec-literal clamp: at full capacity there is no truncation, so no
+# negative v and nothing for the floor to do -- this must match dense exactly.
+{"name": "curve_topk_k100_vfloor0", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 1.00, "fixed_k": true, "v_floor": 0.0, "scale": "micro", "steps": 3000, "no_ckpt": true}

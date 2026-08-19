@@ -158,6 +158,93 @@ microgpt_sa_best.pt`, `python bench.py microgpt_sa_best.pt`) for a head-to-head.
 
 ---
 
+## Experiment: spectral optimizer state
+
+A third learning-rule experiment, in `spectral/` plus four root scripts. The
+model, corpus and schedule are untouched — what changes is **where the optimizer
+keeps its memory**. The full experiment specification — research questions,
+metrics, hypotheses, failure criteria, and what has actually been verified —
+lives in [`.specs/spectral-optimizer-state.md`](.specs/spectral-optimizer-state.md).
+
+AdamW stores two fp32 values per parameter (`m` and `v`), so its state is `8N`
+bytes — for this model, more memory than the model itself. The question is
+whether those `N` numbers are really `N` independent numbers, or whether they
+carry enough structure to be described by `K << N` coefficients of a **fixed**
+basis (a 2D DCT over each weight matrix). Fixed matters: unlike a learned or
+SVD-derived subspace, the basis itself costs nothing to store.
+
+Because the DCT is linear, the state recursions carry over exactly:
+
+```
+SGD    M_t = β·M_{t-1} + T(g_t)
+AdamW  M_t = β₁·M_{t-1} + (1-β₁)·T(g_t)
+       V_t = β₂·V_{t-1} + (1-β₂)·T(g_t²)      ← T(g²), never T(g)²
+```
+
+so with **every** coefficient kept, these optimizers are algebraically identical
+to `torch.optim.SGD` / `torch.optim.AdamW` — `spectral_selftest.py` asserts it to
+floating-point tolerance. Truncation to `K` coefficients is then the *only*
+difference between a compressed run and its dense control, which is what makes a
+loss delta mean something.
+
+```bash
+# 1. correctness gate: transforms, controller, and K=N equivalence with torch's optimizers
+python spectral_selftest.py
+
+# 2. the go/no-go measurement: how many coefficients does the state actually need?
+python spectral_probe.py --scale micro --steps 3000 --probe-interval 250
+
+# 3. controls and compressed runs (same seed -> same init, same batch order)
+python train_spectral.py --opt adamw --state dense --scale micro --name adamw_dense
+python train_spectral.py --opt adamw --state dct --select topk --kmax-frac 0.05 \
+    --mode instrumented --scale micro --name adamw_dct_topk05
+
+# 4. the whole screening matrix, then the tables
+python train_spectral.py --sweep experiments/mvp_screen.jsonl
+python spectral_report.py runs/ --plots
+```
+
+**Result: no-go.** The screen ran end to end at micro scale. Optimizer state is
+*not* usefully compressible in a fixed orthonormal basis. The first moment needs
+more DCT coefficients than raw coordinates (0.73N vs 0.70N at tau=0.99), and
+shuffling a tensor's entries barely changes that — the DCT finds no spatial
+structure to exploit. The second moment *is* energy-concentrated (86% of its
+energy in 1% of coefficients), but AdamW divides by `sqrt(v)`, so the update
+depends on `v`'s small values, exactly where an energy-optimal truncation errs.
+The one variant that trains within 1% of dense AdamW — spectral `v`, dense `m` —
+saves 1.78x of optimizer state for 44% of throughput, and its quality is flat in
+K (1%, 5% and 10% of coefficients are indistinguishable), so the spectral
+representation is not what makes it work. Adafactor's factored second moment does
+the same job with 3x less storage, no transform cost and no positivity problem.
+Full numbers, mechanism and the surprises (DCT-Low beats DCT-TopK for training
+even though TopK reconstructs better) are in
+[`.specs/spectral-optimizer-state.md`](.specs/spectral-optimizer-state.md),
+sections 42-43.
+
+**Start with the probe.** It trains with an ordinary dense AdamW and only
+*measures*, comparing four bases — best-K DCT, low-frequency DCT, the state's own
+coordinates, and DCT after shuffling the entries. The last two are the controls
+that matter: if raw top-K is as compact as DCT top-K, or if shuffling the entries
+doesn't hurt, then the DCT is finding sparsity that was already there rather than
+spatial structure, and there is nothing here worth compressing.
+
+Two execution modes, and they follow the *same* optimization path:
+
+| Mode | What it does | Valid for |
+|---|---|---|
+| `--mode perf` | no dense state anywhere; capacity is sized from a proxy spectrum the optimizer can actually see | memory + throughput benchmarks |
+| `--mode instrumented` | additionally keeps shadow dense states, **never used to update a parameter**, to measure oracle `K_required`, reconstruction error and update-fidelity | understanding what happened |
+
+Instrumented runs deliberately allocate dense state for measurement, so they are
+*not* memory benchmarks; `summary.json` flags them and the report marks them `(i)`.
+
+Only the block projection matrices (`qkv`, `proj`, `fc`, `out`) get spectral
+state — embeddings, the tied head and the RMSNorm gains stay dense — so every run
+reports its **spectral coverage**, without which a whole-model memory number
+can't be read.
+
+---
+
 ## Files
 
 | File | Role |
@@ -169,6 +256,11 @@ microgpt_sa_best.pt`, `python bench.py microgpt_sa_best.pt`) for a head-to-head.
 | `train_sa.py` | Gradient-free simulated-annealing trainer. |
 | `infer.py` | Story completion from any checkpoint (backprop or SA). |
 | `bench.py` | TinyStories eval-prompt benchmark: perplexity, bits/char, quality heuristics, optional LLM judge. |
+| `spectral/` | Spectral optimizer-state module: DCT transforms, sparse state + dynamic-K controller, metrics, `SpectralSGD` / `SpectralAdamW`, telemetry. |
+| `spectral_selftest.py` | Correctness gate — run before anything else (K=N equivalence with torch's optimizers). |
+| `spectral_probe.py` | Measures how compressible optimizer state is under a *dense* run. The experiment's go/no-go. |
+| `train_spectral.py` | Trainer for the spectral experiment: dense controls and compressed runs, single or swept. |
+| `spectral_report.py` | Aggregates runs into the result tables and figures. |
 | `download_tinystories.py` | Fetch the TinyStories corpus from Hugging Face. |
 
 Checkpoints embed `n_head` (the one hyper-parameter not recoverable from the raw
@@ -358,6 +450,16 @@ gradient-free training variant. Attributions are recorded in [`NOTICE`](NOTICE).
 
 ## References
 
+- **DCT via FFT** — Makhoul, J. *A Fast Cosine Transform in One and Two
+  Dimensions.* IEEE Trans. ASSP 28(1), 27–34 (1980). The even-extension identity
+  behind `spectral/transforms.py`; the implementation here is derived from the
+  identity directly and checked against an explicit DCT matrix in
+  `spectral_selftest.py`.
+- **Memory-efficient optimizer state** (comparison points for the spectral
+  experiment, not dependencies) — GaLore (arXiv:2403.03507) and COAP
+  (arXiv:2412.00071) reduce optimizer-state memory by projecting gradients into
+  a *learned* low-rank subspace. The experiment here asks the narrower question
+  of whether a **fixed** basis, which costs nothing to store, is enough.
 - **TinyStories** — Eldan, R. & Li, Y. *TinyStories: How Small Can Language Models
   Be and Still Speak Coherent English?* arXiv:2305.07759 (2023).
   https://arxiv.org/abs/2305.07759 (`roneneldan/TinyStories` on Hugging Face)

@@ -1,0 +1,68 @@
+# Coarse screening matrix -- spec sections 28 and 37 (MVP steps 1-9), micro scale, one seed.
+# Run with:  python train_spectral.py --sweep experiments/mvp_screen.jsonl
+# Start coarse; only widen around whatever turns out to be interesting. Seeds come later
+# (spec section 30) and only for configurations that survive this screen.
+#
+# Spectral AdamW entries carry v_floor=1e-8. Spec section 15's literal rule (clamp a
+# truncated v at exactly 0) leaves the AdamW denominator at eps, so those runs diverge in
+# a handful of steps and would measure the collapse rather than compression -- confirmed
+# by spectral_selftest.py. The floor is ~100x below a typical v here, so it bounds the
+# update without dominating it. One spec-literal run is kept at the end as the control
+# that shows the collapse; report any result that used a floor as having used one.
+#
+# steps 1-2: dense controls. Every delta in the report is measured against these.
+{"name": "sgd_dense", "opt": "sgd", "state": "dense", "scale": "micro", "steps": 3000}
+{"name": "adamw_dense", "opt": "adamw", "state": "dense", "scale": "micro", "steps": 3000}
+#
+# step 5: DCT-SGD, fixed K (no controller) -- isolates truncation from dynamic sizing.
+{"name": "sgd_dct_low_k05_fixed", "opt": "sgd", "state": "dct", "select": "low", "kmax_frac": 0.05, "fixed_k": true, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "sgd_dct_topk_k05_fixed", "opt": "sgd", "state": "dct", "select": "topk", "kmax_frac": 0.05, "fixed_k": true, "scale": "micro", "steps": 3000, "no_ckpt": true}
+#
+# step 6: DCT-SGD, dynamic K. Same K_max, so any difference is the controller's doing (H3).
+{"name": "sgd_dct_low_k05", "opt": "sgd", "state": "dct", "select": "low", "kmax_frac": 0.05, "tau": 0.99, "refresh": 10, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "sgd_dct_topk_k05", "opt": "sgd", "state": "dct", "select": "topk", "kmax_frac": 0.05, "tau": 0.99, "refresh": 10, "scale": "micro", "steps": 3000, "no_ckpt": true}
+#
+# step 7: AdamW with spectral m and DENSE v -- the easy, linear half of the problem alone.
+{"name": "adamw_dct_topk_k05_monly", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "m_only": true, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_low_k05_monly", "opt": "adamw", "state": "dct", "select": "low", "kmax_frac": 0.05, "m_only": true, "scale": "micro", "steps": 3000, "no_ckpt": true}
+#
+# The probe's asymmetry, made runnable: v carries real DCT structure (86% of its energy
+# in 1% of coefficients) while m does not, so spectral-v/dense-m is the only variant the
+# measurement actually supports. At K/N=1% it lands at 0.51x dense state -- right on the
+# section 35 bar -- so these are the runs that decide whether the bar is reachable.
+{"name": "adamw_dct_vonly_k001", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.01, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000}
+{"name": "adamw_dct_vonly_k005", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000}
+{"name": "adamw_dct_vonly_k010", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.1, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_vonly_k001_inst", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.01, "v_only": true, "v_floor": 1e-08, "mode": "instrumented", "telemetry_interval": 100, "scale": "micro", "steps": 3000, "no_ckpt": true}
+#
+# steps 8-9: both moments spectral, K_max/N sweep (spec section 28).
+{"name": "adamw_dct_topk_k001", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.01, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_topk_k002", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.02, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_topk_k005", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_floor": 1e-08, "scale": "micro", "steps": 3000}
+{"name": "adamw_dct_topk_k010", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.1, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_topk_k025", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.25, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_low_k001", "opt": "adamw", "state": "dct", "select": "low", "kmax_frac": 0.01, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_low_k005", "opt": "adamw", "state": "dct", "select": "low", "kmax_frac": 0.05, "v_floor": 1e-08, "scale": "micro", "steps": 3000}
+{"name": "adamw_dct_low_k025", "opt": "adamw", "state": "dct", "select": "low", "kmax_frac": 0.25, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+#
+# reconstruction target: does a tighter tau change what the controller asks for?
+{"name": "adamw_dct_topk_k010_t999", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.1, "v_floor": 1e-08, "tau": 0.999, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_topk_k010_t95", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.1, "v_floor": 1e-08, "tau": 0.95, "scale": "micro", "steps": 3000, "no_ckpt": true}
+#
+# refresh interval R (spec section 12), at one promising K_max rather than crossed with everything.
+{"name": "adamw_dct_topk_k05_r1", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_floor": 1e-08, "refresh": 1, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_topk_k05_r100", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_floor": 1e-08, "refresh": 100, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_topk_k05_r500", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_floor": 1e-08, "refresh": 500, "scale": "micro", "steps": 3000, "no_ckpt": true}
+#
+# instrumented twins of the two headline configs: shadow dense states -> reconstruction error,
+# update cosine, oracle K_required. NOT valid memory benchmarks, and the report marks them.
+{"name": "adamw_dct_topk_k005_inst", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_floor": 1e-08, "mode": "instrumented", "telemetry_interval": 100, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_low_k005_inst", "opt": "adamw", "state": "dct", "select": "low", "kmax_frac": 0.05, "v_floor": 1e-08, "mode": "instrumented", "telemetry_interval": 100, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "sgd_dct_topk_k005_inst", "opt": "sgd", "state": "dct", "select": "topk", "kmax_frac": 0.05, "mode": "instrumented", "telemetry_interval": 100, "scale": "micro", "steps": 3000, "no_ckpt": true}
+#
+# throughput: same config with sampled phase timing on, to price the transforms (section 23).
+{"name": "adamw_dct_topk_k005_prof", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_floor": 1e-08, "profile": true, "scale": "micro", "steps": 1000, "no_ckpt": true}
+#
+# spec-literal section 15 control: v clamped at exactly 0. Expected to diverge;
+# it is here so the failure is on the record rather than a surprise.
+{"name": "adamw_dct_topk_k005_vfloor0", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_floor": 0.0, "scale": "micro", "steps": 500, "no_ckpt": true}
