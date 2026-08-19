@@ -54,8 +54,15 @@ HEADER = (['step', 'tensor', 'state', 'basis', 'n', 'tau', 'k_req', 'k_req_over_
           + [f'resid_at_{int(f * 100)}pct' for f in RESID_FRACS])
 
 FID_BUDGETS = (0.01, 0.05, 0.10, 0.25)
-FID_HEADER = ['step', 'tensor', 'n', 'budget', 'variant', 'update_cosine', 'update_rel_norm',
-              'update_rel_err', 'm_recon_err', 'v_recon_err', 'v_neg_frac', 'v_clamped_at_zero']
+FID_HEADER = ['step', 'tensor', 'n', 'budget', 'variant', 'floor', 'update_cosine',
+              'update_rel_norm', 'update_rel_err', 'm_recon_err', 'v_recon_err', 'v_neg_frac',
+              'v_at_floor']
+# How a reconstructed second moment is made non-negative before 1/sqrt(v) sees it.
+# 'clamp0' is spec section 15 as written; the others exist because clamping at exactly
+# zero does not produce a bad approximation, it produces a singular one -- the
+# denominator becomes eps and that element's step is ~1e5x oversized, which swamps
+# every fidelity metric regardless of how good the rest of the reconstruction is.
+V_FLOORS = ('clamp0', 'abs1e-8', 'rel1e-3')
 
 _PERM = {}
 
@@ -177,6 +184,7 @@ def summarize(path):
         for r in csv.DictReader(open(fid_path)):
             r['budget'] = float(r['budget'])
             r['update_cosine'] = float(r['update_cosine'])
+            r['update_rel_norm'] = float(r['update_rel_norm'])
             rows.append(r)
         print_fidelity(rows)
 
@@ -190,19 +198,41 @@ def truncate_topk(x, k, dct):
     return dct.synthesize(keep.view_as(x))
 
 
+def floored(v_raw, policy):
+    """Make a reconstructed second moment non-negative under one policy.
+
+    `rel1e-3` is floored at a thousandth of the reconstruction's own mean, which
+    is deployable: for an orthonormal DCT the mean IS the DC coefficient over
+    sqrt(mn), so it is known without keeping anything extra.
+    """
+    if policy == 'clamp0':
+        return v_raw.clamp_min(0.0)
+    if policy == 'abs1e-8':
+        return v_raw.clamp_min(1e-8)
+    return v_raw.clamp_min(max(1e-30, 1e-3 * float(v_raw.mean())))
+
+
 def fidelity_rows(m, v, t, dct, betas=(0.9, 0.95), eps=1e-8):
     """How good is the UPDATE when the state is truncated? (spec section 20)
 
     Retained energy answers a question about the state; it does not answer the
     question that matters, because AdamW does not use `v` -- it uses
     `1/sqrt(v)`. A second moment can hold 86% of its energy in 1% of its DCT
-    coefficients and still produce a bad update, since the reciprocal square
-    root amplifies exactly the small values that a low-order reconstruction gets
-    wrong, and any element pushed below zero has to be clamped first.
+    coefficients and still produce a useless update, because the reciprocal
+    square root amplifies exactly the small values a low-order reconstruction
+    gets wrong, and any element driven below zero has to be made positive first.
 
-    So this measures the thing directly: reconstruct m and/or v at a budget,
-    form the update AdamW would actually take, and compare it against the update
-    the dense state gives. `m_only`/`v_only` isolate which moment is responsible.
+    That last step is not a detail. DCT ringing puts a few percent of elements
+    below zero at EVERY budget -- the fraction is set by the transform, not by
+    K -- so clamping them to exactly zero hands those elements a denominator of
+    `eps` and an update ~1e5 times too large. They then dominate the update norm,
+    and the measured cosine reports the singularity rather than the
+    approximation, never improving as K grows. Each floor policy is therefore
+    measured separately: `clamp0` is the spec-literal rule and shows the damage,
+    the floored variants show what the spectral approximation is actually worth.
+
+    `update_rel_norm` is reported alongside the cosine precisely so this failure
+    is visible: a value far above 1 means a handful of elements have taken over.
     """
     b1, b2 = betas
     bc1, bc2 = 1 - b1 ** t, 1 - b2 ** t
@@ -212,18 +242,27 @@ def fidelity_rows(m, v, t, dct, betas=(0.9, 0.95), eps=1e-8):
         k = max(1, int(f * m.numel()))
         m_h = truncate_topk(m, k, dct)
         v_raw = truncate_topk(v, k, dct)
-        v_h = v_raw.clamp_min(0.0)
         neg = negative_v_stats(v_raw)
-        m_err, v_err = state_error(m, m_h), state_error(v, v_h)
-        for variant, (mm, vv) in (('m_only', (m_h, v)), ('v_only', (m, v_h)), ('both', (m_h, v_h))):
-            cos, rnorm, rerr = update_fidelity(u_dense, (mm / bc1) / ((vv / bc2).sqrt() + eps))
-            rows.append({'n': m.numel(), 'budget': f, 'variant': variant, 'update_cosine': cos,
-                         'update_rel_norm': rnorm, 'update_rel_err': rerr,
-                         'm_recon_err': m_err if variant != 'v_only' else '',
-                         'v_recon_err': v_err if variant != 'm_only' else '',
-                         'v_neg_frac': neg['neg_frac'] if variant != 'm_only' else '',
-                         'v_clamped_at_zero': float((v_h == 0).float().mean())
-                         if variant != 'm_only' else ''})
+        m_err = state_error(m, m_h)
+
+        cos, rnorm, rerr = update_fidelity(u_dense, (m_h / bc1) / ((v / bc2).sqrt() + eps))
+        rows.append({'n': m.numel(), 'budget': f, 'variant': 'm_only', 'floor': 'n/a',
+                     'update_cosine': cos, 'update_rel_norm': rnorm, 'update_rel_err': rerr,
+                     'm_recon_err': m_err, 'v_recon_err': '', 'v_neg_frac': '', 'v_at_floor': ''})
+
+        for policy in V_FLOORS:
+            v_h = floored(v_raw, policy)
+            at_floor = float((v_h == v_h.min()).float().mean()) if policy != 'clamp0' \
+                else float((v_h == 0).float().mean())
+            v_err = state_error(v, v_h)
+            for variant, mm in (('v_only', m), ('both', m_h)):
+                cos, rnorm, rerr = update_fidelity(
+                    u_dense, (mm / bc1) / ((v_h / bc2).sqrt() + eps))
+                rows.append({'n': m.numel(), 'budget': f, 'variant': variant, 'floor': policy,
+                             'update_cosine': cos, 'update_rel_norm': rnorm, 'update_rel_err': rerr,
+                             'm_recon_err': m_err if variant == 'both' else '',
+                             'v_recon_err': v_err, 'v_neg_frac': neg['neg_frac'],
+                             'v_at_floor': at_floor})
     return rows
 
 
@@ -232,19 +271,40 @@ def print_fidelity(rows):
     if not rows:
         return
     mean = lambda xs: sum(xs) / len(xs) if xs else float('nan')
-    variants = ('m_only', 'v_only', 'both')
-    print("\n== AdamW update fidelity under DCT-TopK truncation (cosine vs the dense update) ==")
-    print(f"  {'K/N':>6} " + " ".join(f"{v:>12}" for v in variants)
-          + f" {'v<0 frac':>10} {'v clamped':>10}")
+
+    def pick(budget, variant, floor=None):
+        return [r for r in rows if r['budget'] == budget and r['variant'] == variant
+                and (floor is None or r['floor'] == floor)]
+
+    print("\n== AdamW update fidelity under DCT-TopK truncation ==")
+    print("   cosine with the dense update; |u|/|u*| is the relative update norm\n")
+    print(f"  {'K/N':>5} {'m_only':>9} {'m |u|/|u*|':>11} | "
+          + " | ".join(f"{'v_only ' + fl:>16}" for fl in V_FLOORS))
     for f in FID_BUDGETS:
-        at = [r for r in rows if r['budget'] == f]
-        cells = [f"{mean([r['update_cosine'] for r in at if r['variant'] == v]):>12.4f}"
-                 for v in variants]
-        neg = mean([float(r['v_neg_frac']) for r in at if r['variant'] == 'v_only'])
-        clamped = mean([float(r['v_clamped_at_zero']) for r in at if r['variant'] == 'v_only'])
-        print(f"  {f * 100:>5.0f}% " + " ".join(cells) + f" {neg:>10.4f} {clamped:>10.4f}")
-    print("  m_only = only the first moment truncated; v_only = only the second; both = both.\n"
-          "  Cosine near 1.0 means the compressed state still takes essentially the dense step.")
+        m_rows = pick(f, 'm_only')
+        cells = []
+        for fl in V_FLOORS:
+            r = pick(f, 'v_only', fl)
+            cells.append(f"{mean([x['update_cosine'] for x in r]):>7.4f}"
+                         f" ({mean([x['update_rel_norm'] for x in r]):>7.1e})")
+        print(f"  {f * 100:>4.0f}% {mean([x['update_cosine'] for x in m_rows]):>9.4f} "
+              f"{mean([x['update_rel_norm'] for x in m_rows]):>11.2f} | " + " | ".join(cells))
+
+    print(f"\n  {'K/N':>5} " + " ".join(f"{'both ' + fl:>18}" for fl in V_FLOORS)
+          + f" {'v<0 frac':>10} {'v at floor':>11}")
+    for f in FID_BUDGETS:
+        cells = [f"{mean([x['update_cosine'] for x in pick(f, 'both', fl)]):>18.4f}"
+                 for fl in V_FLOORS]
+        r = pick(f, 'v_only', 'clamp0')
+        print(f"  {f * 100:>4.0f}% " + " ".join(cells)
+              + f" {mean([float(x['v_neg_frac']) for x in r]):>10.4f}"
+              + f" {mean([float(x['v_at_floor']) for x in r]):>11.4f}")
+
+    print("\n  clamp0 is spec section 15 as written. If its cosine is far below the floored\n"
+          "  variants and its |u|/|u*| is huge, the metric is reporting the eps singularity\n"
+          "  (a few percent of elements with a denominator of eps), not the approximation.\n"
+          "  Compare floored columns across K: those must improve with K, or the state\n"
+          "  genuinely does not reconstruct.")
 
 
 def main():

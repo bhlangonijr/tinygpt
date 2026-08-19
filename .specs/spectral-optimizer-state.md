@@ -1191,6 +1191,46 @@ therefore update fidelity (section 20), which `spectral_probe.py` now computes
 directly from the dense state at each budget, reporting `m_only` / `v_only` /
 `both` separately alongside the negative-`v` and clamp fractions.
 
+**Update fidelity (section 20), first measurement.** Truncating only `m` and
+leaving `v` dense is a clean measurement — no clamp is involved — and it is
+decisive:
+
+| K/N | update cosine, m truncated |
+|---|---:|
+| 1% | 0.250 |
+| 5% | 0.447 |
+| 10% | 0.573 |
+| 25% | 0.777 |
+
+Monotone, as an approximation must be, and poor throughout. Even at a 25% budget
+— which already costs *more* than dense state once indices are counted — the
+compressed optimizer takes a step only 0.78-aligned with the true one. The first
+moment is settled: not usefully compressible in this basis.
+
+The `v_only` and `both` columns of that first run are **not** a measurement of
+the approximation, and were discarded. They clamped the reconstruction at exactly
+zero (section 15 as written), and the negative fraction sits at ~5% at *every*
+budget (0.047, 0.050, 0.051, 0.045) because DCT ringing is set by the transform,
+not by `K`. Those elements receive a denominator of `eps` instead of `sqrt(v)`,
+making their step ~1e5 times too large; they then dominate the update norm, and
+the resulting cosine (0.19–0.23) measures the singularity rather than the
+reconstruction — which is why it failed to improve with `K` while `v`'s residual
+energy fell from 0.140 to 0.031.
+
+Two conclusions follow regardless of the re-measurement:
+
+1. **A floor on the reconstructed second moment is mandatory, not optional**, for
+   any spectral-`v` scheme. The clamped fraction does not shrink appreciably with
+   budget, so there is no `K` at which the problem goes away.
+2. **Update-fidelity metrics must be reported with `update_rel_norm` beside
+   them.** A cosine alone cannot distinguish a poor approximation from a few
+   singular elements; the relative norm makes it obvious at a glance.
+
+The probe now evaluates each budget under three policies — `clamp0` (spec
+literal), an absolute floor, and a floor at a thousandth of the reconstruction's
+own mean (deployable, since for an orthonormal DCT the mean is the DC
+coefficient) — and reports cosine and relative norm for each.
+
 Caveats: micro scale (192-wide matrices), early training, single seed. Scale may
 move the magnitudes; it is unlikely to reverse the within-tensor shuffle and
 identity controls, which compare a tensor against itself.
