@@ -292,8 +292,13 @@ def test_truncation():
           f"{mem['persistent_state_bytes']}B vs dense {mem['dense_equivalent_bytes']}B "
           f"(ratio {mem['state_ratio']:.3f})")
 
-    # truncation genuinely can break v >= 0; the clamp is a patch, not a fix
-    m = torch.randn(32, 32, dtype=torch.float64).abs()
+    # truncation genuinely can break v >= 0; the clamp is a patch, not a fix.
+    # Use a spiky-but-strictly-positive state (like Adam's v = g^2: mostly small,
+    # a few large): its energy spreads across high frequencies, so keeping only the
+    # top coefficients rings below zero. (A smooth random positive field usually
+    # survives top-K truncation, which is why this needs a deterministic spike.)
+    m = torch.full((32, 32), 0.01, dtype=torch.float64)
+    m[16, 16] += 1.0
     c = dct2(m).reshape(-1)
     keep = torch.zeros_like(c)
     idx = c.abs().topk(20).indices
