@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Status** | MVP implemented (section 37 steps 1–9, DCT only). Correctness gate passing; step 4 probe run — **premise fails at micro scale**, see section 42. |
+| **Status** | Complete at micro scale (section 37 steps 1–9, DCT only). **Outcome: no-go — see section 43.** |
 | **Implementation** | `spectral/`, `train_spectral.py`, `spectral_probe.py`, `spectral_selftest.py`, `spectral_report.py` |
 | **Reconciliation** | Sections 40–42 map this document to the code and record every deviation |
 | **Testbed** | tinyGPT (this repo): one shared model, TinyStories, bits/char on a held-out file |
@@ -1265,3 +1265,97 @@ not beat it, the spectral representation is decoration — the same question
 Caveats: micro scale (192-wide matrices), early training, single seed. Scale may
 move the magnitudes; it is unlikely to reverse the within-tensor shuffle and
 identity controls, which compare a tensor against itself.
+
+
+---
+
+## 43. Outcome (micro scale, 30-config screen, one seed)
+
+The full screening matrix ran: two dense controls and 28 spectral configurations,
+3,000 steps each on identical data, initialization and schedule.
+
+### Quality and resources
+
+| Config | val loss | vs dense | state | reduction | tok/s | throughput |
+|---|---:|---:|---:|---:|---:|---:|
+| **AdamW dense (control)** | 2.2018 | — | 1.000 | 1.0x | 194,542 | — |
+| AdamW v-only, K=1% | 2.2129 | +0.50% | 0.561 | 1.78x | 108,110 | −44.4% |
+| AdamW v-only, K=5% | 2.2108 | +0.41% | 0.561 | 1.78x | 108,296 | −44.3% |
+| AdamW v-only, K=10% | 2.2150 | +0.60% | 0.562 | 1.78x | 109,243 | −43.8% |
+| AdamW m-only, K=5% Low | 2.8367 | +28.8% | 0.578 | 1.73x | 109,999 | −43.5% |
+| AdamW m+v, K=25% Low | 2.5297 | +14.9% | 0.334 | 2.99x | 75,845 | −61.0% |
+| AdamW m+v, K=5% Low | 2.8478 | +29.3% | 0.155 | 6.45x | 76,500 | −60.7% |
+| AdamW m+v, K=1% TopK | 3.1629 | +43.7% | 0.125 | 8.00x | 72,850 | −62.6% |
+| AdamW m+v, K=5%, `v_floor=0` | 5.5629 | +152.7% | 0.163 | 6.13x | 65,851 | −66.2% |
+| **SGD-M dense (control)** | 3.5516 | — | 1.000 | 1.0x | 206,758 | — |
+| SGD-M K=5% Low | 3.6368 | +2.40% | 0.156 | 6.41x | 116,977 | −43.4% |
+| SGD-M K=5% TopK | 3.6698 | +3.33% | 0.172 | 5.81x | 114,796 | −44.5% |
+
+### Verdict against section 35
+
+Only one configuration has acceptable quality — spectral `v`, dense `m`:
+
+```
+quality      <= 1% degradation   ->  +0.41 .. +0.60%   PASS
+memory       >= 2x reduction     ->  1.78x             MISS
+throughput   <= 10% loss         ->  -44%              FAIL
+```
+
+**No-go.** The one variant that trains well costs 44% of throughput to save 1.78x
+of optimizer state, which is the section-39 inequality failing outright: the
+memory saved does not cover the compute spent. Some of that 44% is
+implementation (the DCT here uses a 2N even extension rather than a Makhoul-style
+N/2 FFT, worth perhaps 2x), but no plausible constant closes a 4x gap to the 10%
+gate.
+
+### Why the v-only result does not rescue the premise
+
+Quality is **flat in `K`**: 2.2129 / 2.2108 / 2.2150 at 1% / 5% / 10%, a spread
+smaller than seed noise. Ten times more coefficients buys nothing. This is the
+training-level echo of the fidelity measurement in section 42, and it says the
+spectral representation is not what makes the run work — AdamW is simply
+insensitive to the accuracy of its second moment, as long as the denominator is
+kept away from zero.
+
+That insensitivity is a known property, and it is much better exploited by
+existing methods. Adafactor factorizes `v` into row and column vectors: `m + n`
+values instead of `m . n`, which for these matrices is **0.65% of N stored as
+4-byte values (0.026 B/param), against 0.08 B/param for DCT-TopK at K/N = 1%**.
+It is non-negative by construction, so it needs no floor and has no clamp
+pathology, and it costs no transform. It reaches the 2x bar this method missed,
+with none of the throughput penalty. A spectral second moment is dominated on
+every axis.
+
+### Findings worth keeping
+
+1. **DCT-Low beats DCT-TopK for training, consistently**, despite TopK being the
+   L2-optimal K-term approximation: 2.8478 vs 2.9120 (m+v, K=5%), 2.5297 vs
+   2.5812 (K=25%), 2.8367 vs 2.9211 (m-only), 3.6368 vs 3.6698 (SGD-M). Better
+   reconstruction produces a worse optimizer. The mechanism is section 16:
+   TopK's active set churns, and every eviction destroys accumulated history,
+   while Low's deterministic prefix never evicts. **Active-set stability matters
+   more than reconstruction optimality** — a result that inverts the obvious
+   choice of selection policy.
+2. **Dynamic K did nothing** (H3 fails). With `K_required/N ≈ 0.73` and `K_max`
+   at a few percent, the controller pins at `K_max` permanently: dynamic and
+   fixed-K runs are bit-identical (3.6368 both). `tau` is likewise inert
+   (2.7788 / 2.7823 / 2.7886 for 0.999 / 0.99 / 0.95) for the same reason.
+3. **`R = 1` is the best refresh interval** (2.7946 vs 2.8919 at R=100 and 2.9156
+   at R=500) but costs a further 27% throughput. Re-selecting often helps because
+   it keeps the active set matched to a spectrum that keeps moving — which is
+   itself evidence the representation is a poor fit.
+4. **Section 15 confirmed in training**: the spec-literal `v_floor = 0` run
+   stalls at 5.5629 (+152%), never recovering.
+5. **SGD momentum tolerates compression well** (+2.4% at 6.4x state reduction) —
+   but SGD-M dense is itself 61% worse than AdamW dense (3.5516 vs 2.2018), so a
+   compressible momentum buys nothing anyone wants.
+
+### What would have to be true for this to work
+
+The measurements point at a specific, falsifiable requirement rather than a
+vague "needs more work". Any future attempt needs a representation that is
+(a) accurate in *relative* terms on the small values of `v`, not in L2 energy;
+(b) non-negative by construction, so no floor is needed; and (c) cheap enough to
+apply every step. Adafactor already satisfies all three. A fixed orthonormal
+transform satisfies none of them, and section 42 explains why: energy-optimal
+truncation puts its error exactly where `1/sqrt(v)` is most sensitive.

@@ -204,6 +204,23 @@ python train_spectral.py --sweep experiments/mvp_screen.jsonl
 python spectral_report.py runs/ --plots
 ```
 
+**Result: no-go.** The screen ran end to end at micro scale. Optimizer state is
+*not* usefully compressible in a fixed orthonormal basis. The first moment needs
+more DCT coefficients than raw coordinates (0.73N vs 0.70N at tau=0.99), and
+shuffling a tensor's entries barely changes that — the DCT finds no spatial
+structure to exploit. The second moment *is* energy-concentrated (86% of its
+energy in 1% of coefficients), but AdamW divides by `sqrt(v)`, so the update
+depends on `v`'s small values, exactly where an energy-optimal truncation errs.
+The one variant that trains within 1% of dense AdamW — spectral `v`, dense `m` —
+saves 1.78x of optimizer state for 44% of throughput, and its quality is flat in
+K (1%, 5% and 10% of coefficients are indistinguishable), so the spectral
+representation is not what makes it work. Adafactor's factored second moment does
+the same job with 3x less storage, no transform cost and no positivity problem.
+Full numbers, mechanism and the surprises (DCT-Low beats DCT-TopK for training
+even though TopK reconstructs better) are in
+[`.specs/spectral-optimizer-state.md`](.specs/spectral-optimizer-state.md),
+sections 42-43.
+
 **Start with the probe.** It trains with an ordinary dense AdamW and only
 *measures*, comparing four bases — best-K DCT, low-frequency DCT, the state's own
 coordinates, and DCT after shuffling the entries. The last two are the controls
