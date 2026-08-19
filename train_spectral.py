@@ -80,6 +80,7 @@ def parse_args(argv=None):
     p.add_argument('--shrink-ratio', type=float, default=0.75)
     p.add_argument('--shrink-patience', type=int, default=3)
     p.add_argument('--m-only', action='store_true', help='AdamW: spectral m, dense v')
+    p.add_argument('--v-only', action='store_true', help='AdamW: spectral v, dense m')
     p.add_argument('--v-floor', type=float, default=0.0,
                    help='floor for the reconstructed second moment (0 = spec section 15 clamp)')
     p.add_argument('--mode', choices=['perf', 'instrumented'], default='perf')
@@ -120,6 +121,8 @@ def run_name(a):
         bits.append('fixedk')
     if a.m_only:
         bits.append('monly')
+    if a.v_only:
+        bits.append('vonly')
     return "_".join(bits + [a.scale, f"s{a.seed}"])
 
 
@@ -197,7 +200,8 @@ def main(argv=None):
     cfg = SpectralConfig(state=a.state, selection=a.select, kmax_frac=a.kmax_frac,
                          kmin_frac=a.kmin_frac, tau=a.tau, refresh=a.refresh,
                          shrink_ratio=a.shrink_ratio, shrink_patience=a.shrink_patience,
-                         dynamic=not a.fixed_k, m_only=a.m_only, v_floor=a.v_floor, mode=a.mode,
+                         dynamic=not a.fixed_k, m_only=a.m_only, v_only=a.v_only,
+                         v_floor=a.v_floor, mode=a.mode,
                          telemetry_interval=a.telemetry_interval, profile=a.profile)
     tel = Telemetry(os.path.join(out_dir, 'telemetry.csv'), enabled=(a.state != 'dense'))
     if a.torch_baseline:

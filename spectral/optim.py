@@ -25,6 +25,10 @@ Two execution modes (spec section 21), and they follow the SAME optimization
 path -- the mode must not change the trajectory, or instrumented runs would tell
 us nothing about the runs we actually benchmark:
 
+Either moment can be spectral independently (`m_only`, `v_only`), which matters
+because they are not equally compressible -- see section 42 of the spec for the
+measured asymmetry.
+
 * `perf` -- nothing dense is kept for measurement. The capacity controller runs
   on a PROXY spectrum (retained coefficients, plus the current gradient's
   contribution wherever the active set does not reach). This is the only signal
@@ -61,6 +65,7 @@ class SpectralConfig:
     shrink_patience: int = 3        # H consecutive low refreshes before shrinking
     dynamic: bool = True            # False -> K pinned at K_max (fixed-K control)
     m_only: bool = False            # AdamW: spectral m, dense v (spec step 7)
+    v_only: bool = False            # AdamW: spectral v, dense m (the mirror; see section 42)
     seed_new_from_grad: bool = True  # newly activated coefficients keep this step's gradient
     v_floor: float = 0.0            # floor for the reconstructed second moment; see note below
     mode: str = 'perf'              # 'perf' | 'instrumented'
@@ -368,37 +373,46 @@ class SpectralAdamW(_SpectralBase):
 
                 prof = self._profiling(t)
                 m, v = st['m'], st['v']
+                # Each moment is independently spectral or dense, so `m_only` and
+                # `v_only` are the same code path with a different allocation --
+                # and a dense moment costs no transform at all.
+                m_spec, v_spec = isinstance(m, SpectralState), isinstance(v, SpectralState)
                 t0 = self._now(p.device) if prof else 0.0
-                cg = self.transform.analyze(g).reshape(-1)
-                cg2 = None if cfg.m_only else self.transform.analyze(g * g).reshape(-1)
+                cg = self.transform.analyze(g).reshape(-1) if m_spec else None
+                cg2 = self.transform.analyze(g * g).reshape(-1) if v_spec else None
                 if prof:
                     self._add_phase('transform', self._now(p.device) - t0)
-                m.accumulate(cg, b1, 1 - b1)
-                if cfg.m_only:
-                    v.mul_(b2).addcmul_(g, g, value=1 - b2)     # exact dense second moment
+
+                if m_spec:
+                    m.accumulate(cg, b1, 1 - b1)
                 else:
-                    v.accumulate(cg2, b2, 1 - b2)
+                    m.mul_(b1).add_(g, alpha=1 - b1)
+                if v_spec:
+                    v.accumulate(cg2, b2, 1 - b2)               # T(g^2), never T(g)^2
+                else:
+                    v.mul_(b2).addcmul_(g, g, value=1 - b2)
 
                 if t == 1 or t % cfg.refresh == 0:
                     t1 = self._now(p.device) if prof else 0.0
-                    st['k_req_proxy_m'], st['churn_m'] = self._refresh(m, cg * (1 - b1))
-                    if not cfg.m_only:
+                    if m_spec:
+                        st['k_req_proxy_m'], st['churn_m'] = self._refresh(m, cg * (1 - b1))
+                    if v_spec:
                         st['k_req_proxy_v'], st['churn_v'] = self._refresh(v, cg2 * (1 - b2))
                     if prof:
                         self._add_phase('refresh', self._now(p.device) - t1)
 
                 buf = self._scratch_for(p)
                 t2 = self._now(p.device) if prof else 0.0
-                m_hat = m.reconstruct(buf)
-                v_raw = None if cfg.m_only else v.reconstruct(buf)
+                m_hat = m.reconstruct(buf) if m_spec else m
+                v_raw = v.reconstruct(buf) if v_spec else None
                 if prof:
                     self._add_phase('inverse', self._now(p.device) - t2)
                     self.phase_samples += 1
-                if cfg.m_only:
-                    v_hat, clamp_frac = v, 0.0
-                else:
-                    clamp_frac = float((v_raw < 0).float().mean()) if self.instrumented else 0.0
+                if v_spec:
+                    clamp_frac = float((v_raw < cfg.v_floor).float().mean()) if self.instrumented else 0.0
                     v_hat = v_raw.clamp_min(cfg.v_floor)        # spec section 15
+                else:
+                    v_hat, clamp_frac = v, 0.0
                 p.addcdiv_(m_hat / bc1, (v_hat / bc2).sqrt() + eps, value=-lr)
 
                 if self.instrumented:
@@ -410,7 +424,8 @@ class SpectralAdamW(_SpectralBase):
     def _init_adam(self, p, st, group):
         self._init_common(p, st, group)
         if st['spectral']:
-            st['m'] = self._new_spectral(p)
+            assert not (self.cfg.m_only and self.cfg.v_only), "m_only and v_only are exclusive"
+            st['m'] = torch.zeros_like(p) if self.cfg.v_only else self._new_spectral(p)
             st['v'] = torch.zeros_like(p) if self.cfg.m_only else self._new_spectral(p)
             if self.instrumented:
                 st['m_shadow'] = torch.zeros_like(p)

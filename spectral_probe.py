@@ -41,7 +41,8 @@ import torch
 import config as C
 from data import load_data, make_get_batch
 from model import build_model
-from spectral.metrics import energy_profile, k_required, retained_energy, spectral_entropy
+from spectral.metrics import (energy_profile, k_required, negative_v_stats, retained_energy,
+                              spectral_entropy, state_error, update_fidelity)
 from spectral.transforms import DCT2D
 from train_spectral import SCALES, build_param_groups
 
@@ -51,6 +52,10 @@ BASES = ('dct_topk', 'dct_low', 'identity_topk', 'dct_shuffled')
 HEADER = (['step', 'tensor', 'state', 'basis', 'n', 'tau', 'k_req', 'k_req_over_n',
            'spectral_entropy', 'k_eff_over_n']
           + [f'resid_at_{int(f * 100)}pct' for f in RESID_FRACS])
+
+FID_BUDGETS = (0.01, 0.05, 0.10, 0.25)
+FID_HEADER = ['step', 'tensor', 'n', 'budget', 'variant', 'update_cosine', 'update_rel_norm',
+              'update_rel_err', 'm_recon_err', 'v_recon_err', 'v_neg_frac', 'v_clamped_at_zero']
 
 _PERM = {}
 
@@ -166,6 +171,81 @@ def summarize(path):
     print("\n  A ratio >= 1.00 means the compressed representation costs more than the dense\n"
           "  state it replaces. Spec section 35 wants <= 0.50.")
 
+    fid_path = os.path.join(os.path.dirname(path) or '.', 'probe_fidelity.csv')
+    if os.path.exists(fid_path):
+        rows = []
+        for r in csv.DictReader(open(fid_path)):
+            r['budget'] = float(r['budget'])
+            r['update_cosine'] = float(r['update_cosine'])
+            rows.append(r)
+        print_fidelity(rows)
+
+
+def truncate_topk(x, k, dct):
+    """Best K-term DCT approximation of `x` (the DCT-TopK policy, applied offline)."""
+    c = dct.analyze(x).reshape(-1)
+    keep = torch.zeros_like(c)
+    i = c.abs().topk(k).indices
+    keep[i] = c[i]
+    return dct.synthesize(keep.view_as(x))
+
+
+def fidelity_rows(m, v, t, dct, betas=(0.9, 0.95), eps=1e-8):
+    """How good is the UPDATE when the state is truncated? (spec section 20)
+
+    Retained energy answers a question about the state; it does not answer the
+    question that matters, because AdamW does not use `v` -- it uses
+    `1/sqrt(v)`. A second moment can hold 86% of its energy in 1% of its DCT
+    coefficients and still produce a bad update, since the reciprocal square
+    root amplifies exactly the small values that a low-order reconstruction gets
+    wrong, and any element pushed below zero has to be clamped first.
+
+    So this measures the thing directly: reconstruct m and/or v at a budget,
+    form the update AdamW would actually take, and compare it against the update
+    the dense state gives. `m_only`/`v_only` isolate which moment is responsible.
+    """
+    b1, b2 = betas
+    bc1, bc2 = 1 - b1 ** t, 1 - b2 ** t
+    u_dense = (m / bc1) / ((v / bc2).sqrt() + eps)
+    rows = []
+    for f in FID_BUDGETS:
+        k = max(1, int(f * m.numel()))
+        m_h = truncate_topk(m, k, dct)
+        v_raw = truncate_topk(v, k, dct)
+        v_h = v_raw.clamp_min(0.0)
+        neg = negative_v_stats(v_raw)
+        m_err, v_err = state_error(m, m_h), state_error(v, v_h)
+        for variant, (mm, vv) in (('m_only', (m_h, v)), ('v_only', (m, v_h)), ('both', (m_h, v_h))):
+            cos, rnorm, rerr = update_fidelity(u_dense, (mm / bc1) / ((vv / bc2).sqrt() + eps))
+            rows.append({'n': m.numel(), 'budget': f, 'variant': variant, 'update_cosine': cos,
+                         'update_rel_norm': rnorm, 'update_rel_err': rerr,
+                         'm_recon_err': m_err if variant != 'v_only' else '',
+                         'v_recon_err': v_err if variant != 'm_only' else '',
+                         'v_neg_frac': neg['neg_frac'] if variant != 'm_only' else '',
+                         'v_clamped_at_zero': float((v_h == 0).float().mean())
+                         if variant != 'm_only' else ''})
+    return rows
+
+
+def print_fidelity(rows):
+    """Summary of the section-20 metrics -- the numbers that decide viability."""
+    if not rows:
+        return
+    mean = lambda xs: sum(xs) / len(xs) if xs else float('nan')
+    variants = ('m_only', 'v_only', 'both')
+    print("\n== AdamW update fidelity under DCT-TopK truncation (cosine vs the dense update) ==")
+    print(f"  {'K/N':>6} " + " ".join(f"{v:>12}" for v in variants)
+          + f" {'v<0 frac':>10} {'v clamped':>10}")
+    for f in FID_BUDGETS:
+        at = [r for r in rows if r['budget'] == f]
+        cells = [f"{mean([r['update_cosine'] for r in at if r['variant'] == v]):>12.4f}"
+                 for v in variants]
+        neg = mean([float(r['v_neg_frac']) for r in at if r['variant'] == 'v_only'])
+        clamped = mean([float(r['v_clamped_at_zero']) for r in at if r['variant'] == 'v_only'])
+        print(f"  {f * 100:>5.0f}% " + " ".join(cells) + f" {neg:>10.4f} {clamped:>10.4f}")
+    print("  m_only = only the first moment truncated; v_only = only the second; both = both.\n"
+          "  Cosine near 1.0 means the compressed state still takes essentially the dense step.")
+
 
 def main():
     p = argparse.ArgumentParser(description="offline optimizer-state compressibility probe")
@@ -214,10 +294,13 @@ def main():
     print(f"probe | device {device} | params {model.num_params():,} | "
           f"{len(eligible)} eligible tensors | coverage {coverage:.1%}", flush=True)
 
+    fid_path = os.path.join(out_dir, 'probe_fidelity.csv')
     with open(csv_path, 'w', newline='') as f:
         csv.DictWriter(f, HEADER).writeheader()
+    with open(fid_path, 'w', newline='') as f:
+        csv.DictWriter(f, FID_HEADER).writeheader()
 
-    agg = defaultdict(list)
+    agg, fid_all = defaultdict(list), []
     t0 = time.time()
     model.train()
     for step in range(a.steps):
@@ -229,7 +312,7 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip)
 
         if step % a.probe_interval == 0:
-            rows = []
+            rows, fid = [], []
             with torch.no_grad():
                 for name, param in eligible.items():
                     st = opt.state.get(param, {})
@@ -242,8 +325,15 @@ def main():
                             rows.append({'step': step, 'tensor': name, 'state': sname, **r})
                             if r['tau'] == 0.99:
                                 agg[(sname, r['basis'])].append(r['k_req_over_n'])
+                    if 'm' in states:
+                        t_adam = int(float(st['step'])) if 'step' in st else step + 1
+                        for r in fidelity_rows(states['m'], states['v'], max(1, t_adam), dct):
+                            fid.append({'step': step, 'tensor': name, **r})
             with open(csv_path, 'a', newline='') as f:
                 csv.DictWriter(f, HEADER).writerows(rows)
+            with open(fid_path, 'a', newline='') as f:
+                csv.DictWriter(f, FID_HEADER).writerows(fid)
+            fid_all.extend(fid)
             print(f"step {step:6d} | loss {loss.item():.4f} | {time.time() - t0:.0f}s "
                   f"| probed {len(rows)} rows", flush=True)
         opt.step()
@@ -258,7 +348,8 @@ def main():
             vals = agg.get((sname, basis), [])
             cells.append(f"{sum(vals) / len(vals):>15.4f}" if vals else f"{'-':>15}")
         print(f"  {sname:<6} " + " ".join(cells))
-    print(f"\nwrote {csv_path}")
+    print_fidelity(fid_all)
+    print(f"\nwrote {csv_path} and {fid_path}")
     print("read it like this: dct_topk << identity_topk means the DCT is finding real spatial\n"
           "structure; dct_topk ~ dct_shuffled means it is not, and the premise is weak (section 34).")
 

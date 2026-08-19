@@ -1074,7 +1074,15 @@ Each was a deliberate choice; each is reversible by a flag.
 
 5. **An identity-basis control was added to the probe** beyond the shuffled-DCT
    control the specification names (section 34). It is arguably the more
-   decisive of the two.
+   decisive of the two — it is what showed that `m` is *less* compressible in the
+   DCT than in its own coordinates.
+
+6. **`v_only` was added alongside the specified `m_only`** (section 37 step 7).
+   The spec isolates the first moment on the reasoning that it is the easy,
+   linear half; the measurement says the opposite (H2 is reversed), so the
+   mirror variant — spectral `v`, dense `m` — is the one the data supports, and
+   is now the configuration the screening matrix leads with. Either moment can
+   be spectral independently; a dense moment costs no transform.
 
 ## 42. Verification status
 
@@ -1085,6 +1093,7 @@ Each was a deliberate choice; each is reversible by a flag.
 | `K = N` spectral AdamW ≡ `torch.optim.AdamW`, incl. m-only and the dense fallback | **Passing** (`3.64e-13`) |
 | K controller: grows now, holds in-band, shrinks after `H`, clamps, damps oscillation | **Passing** |
 | Truncation monotonicity, DCT-Low prefix invariant, section-15 divergence | **Passing** after the test corrections recorded below |
+| Section 37 step 4 probe, micro scale | **Executed** — results below |
 | Training loop, telemetry, memory accounting, report generator | **Not yet executed** |
 
 The equivalence row is the one that matters: it establishes that in a compressed
@@ -1135,6 +1144,53 @@ it is the only state where the transform beats both controls in both directions
 non-negative and carrying a large low-frequency component. Its ceiling is still
 only ~14% state savings, well under the bar.
 
-Caveats: micro scale (192-wide matrices), early training, single seed, one `tau`.
-Scale may move the magnitudes; it is unlikely to reverse the within-tensor
-shuffle and identity controls.
+**Full-CSV analysis** (`spectral_probe.py --analyze`) sharpens all of this.
+
+*Sensitivity to `tau`* — the ranking is stable, but `v`'s magnitude is not:
+
+| state | tau=0.95 | tau=0.99 | tau=0.999 |
+|---|---:|---:|---:|
+| m (dct_topk / identity) | 0.544 / 0.496 | 0.729 / 0.695 | 0.873 / 0.856 |
+| v (dct_topk / identity) | **0.133** / 0.520 | 0.431 / 0.739 | 0.724 / 0.888 |
+
+`m` loses to its own coordinates at every target. `v` beats them at every target,
+by 3.9x at `tau=0.95`.
+
+*Residual energy at a fixed budget* (threshold-free, and the clearest view):
+
+| state | K=1% | K=5% | K=10% | K=25% |
+|---|---:|---:|---:|---:|
+| m dct_topk | 0.897 | 0.696 | 0.537 | 0.261 |
+| m identity_topk | 0.853 | 0.622 | 0.461 | 0.212 |
+| v dct_topk | **0.140** | 0.095 | 0.069 | 0.031 |
+| v identity_topk | 0.632 | 0.449 | 0.350 | 0.198 |
+
+**86% of `v`'s energy sits in 1% of its DCT coefficients**, against 37% for its
+own coordinates. That is a large, unambiguous structural signal — and the only
+one in the entire measurement.
+
+*Q2, answered: capacity does not evolve.* From step 250 onward `K_required/N` is
+flat to three decimals (`m` 0.725→0.730, `v` 0.42–0.44). There are no phases, so
+dynamic `K` has nothing to adapt to and H3 has no mechanism at this scale;
+fixed-`K` is the honest default. Per tensor kind, `v` varies somewhat
+(`proj` 0.339 best, `fc` 0.494 worst) while `m` is flat at ~0.73 everywhere.
+
+*Where this leaves the go/no-go.* Compressing `v` alone and leaving `m` dense:
+
+| v budget | B/param | vs dense 8.00 | implied L2 error on v |
+|---|---:|---:|---:|
+| K/N = 1% | 4.08 | **0.51x** | 0.374 |
+| K/N = 5% | 4.40 | 0.55x | 0.308 |
+| K/N = 10% | 4.80 | 0.60x | 0.263 |
+
+That is exactly the section-35 bar (0.50x), reached by compressing one moment.
+But retained energy cannot decide it: AdamW consumes `1/sqrt(v)`, which amplifies
+precisely the small values a low-order reconstruction gets wrong, and any element
+driven below zero must be clamped first (section 15). The deciding measurement is
+therefore update fidelity (section 20), which `spectral_probe.py` now computes
+directly from the dense state at each budget, reporting `m_only` / `v_only` /
+`both` separately alongside the negative-`v` and clamp fractions.
+
+Caveats: micro scale (192-wide matrices), early training, single seed. Scale may
+move the magnitudes; it is unlikely to reverse the within-tensor shuffle and
+identity controls, which compare a tensor against itself.

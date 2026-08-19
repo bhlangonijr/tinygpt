@@ -26,6 +26,15 @@
 {"name": "adamw_dct_topk_k05_monly", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "m_only": true, "scale": "micro", "steps": 3000, "no_ckpt": true}
 {"name": "adamw_dct_low_k05_monly", "opt": "adamw", "state": "dct", "select": "low", "kmax_frac": 0.05, "m_only": true, "scale": "micro", "steps": 3000, "no_ckpt": true}
 #
+# The probe's asymmetry, made runnable: v carries real DCT structure (86% of its energy
+# in 1% of coefficients) while m does not, so spectral-v/dense-m is the only variant the
+# measurement actually supports. At K/N=1% it lands at 0.51x dense state -- right on the
+# section 35 bar -- so these are the runs that decide whether the bar is reachable.
+{"name": "adamw_dct_vonly_k001", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.01, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000}
+{"name": "adamw_dct_vonly_k005", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000}
+{"name": "adamw_dct_vonly_k010", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.1, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
+{"name": "adamw_dct_vonly_k001_inst", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.01, "v_only": true, "v_floor": 1e-08, "mode": "instrumented", "telemetry_interval": 100, "scale": "micro", "steps": 3000, "no_ckpt": true}
+#
 # steps 8-9: both moments spectral, K_max/N sweep (spec section 28).
 {"name": "adamw_dct_topk_k001", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.01, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
 {"name": "adamw_dct_topk_k002", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.02, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
