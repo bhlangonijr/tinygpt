@@ -145,19 +145,30 @@ class _SpectralBase(torch.optim.Optimizer):
         st['name'] = self._names.get(id(p), '')
 
     # ---------------- active-set maintenance ----------------
-    def _refresh(self, s, contrib):
+    def _refresh(self, s, contrib, ref_contrib=None):
         """Size and re-select the active set. Returns (k_required_proxy, churn).
 
-        `contrib` is this step's transformed gradient contribution over the FULL
-        coefficient grid (e.g. `(1-b1).T(g)`). It plays two roles. As a spectrum
-        estimate it fills in what the active set cannot see: inside the active
-        set the real coefficient value is known, outside it the current gradient
-        is the only available evidence. This proxy is the controller's input in
-        BOTH modes -- the shadow states of instrumented mode never touch the
-        update path, so an instrumented run and its perf twin follow the same
-        trajectory. As a seed it initializes newly activated coefficients.
+        Two different quantities are needed here, and conflating them
+        under-provisions `K` badly.
+
+        `contrib` is this step's actual contribution (e.g. `(1-b1).T(g)`), and it
+        SEEDS newly activated coefficients -- that is genuinely what one step
+        adds.
+
+        `ref_contrib` is what the coefficient would grow to if it stayed active,
+        and it is what the spectrum ESTIMATE must use. For an EMA
+        `m <- b.m + (1-b).g` a persistent gradient converges to `g` itself, not
+        to `(1-b).g`, so comparing retained coefficients (which hold accumulated
+        EMAs) against a one-step contribution makes the out-of-set energy look
+        10-20x smaller than it is. The controller then believes it needs fewer
+        coefficients than it does and sits at roughly half its cap. Defaults to
+        `contrib` when the two coincide.
+
+        This proxy is the controller's input in BOTH modes -- the shadow states
+        of instrumented mode never touch the update path, so an instrumented run
+        and its perf twin follow the same trajectory.
         """
-        ref = contrib.abs()
+        ref = (contrib if ref_contrib is None else ref_contrib).abs()
         ref[s.idx] = s.coef.abs()
         order = s.order if s.selection == 'low' else None
         cum, total = energy_profile(ref, order)
@@ -320,7 +331,9 @@ class SpectralSGD(_SpectralBase):
                 m.accumulate(cg, beta, 1.0)
                 if t == 1 or t % cfg.refresh == 0:
                     t1 = self._now(p.device) if prof else 0.0
-                    st['k_req_proxy_momentum'], st['churn_momentum'] = self._refresh(m, cg)
+                    # steady state of `m <- beta.m + g` is g/(1-beta)
+                    st['k_req_proxy_momentum'], st['churn_momentum'] = self._refresh(
+                        m, cg, cg / max(1e-6, 1.0 - beta))
                     if prof:
                         self._add_phase('refresh', self._now(p.device) - t1)
                 t2 = self._now(p.device) if prof else 0.0
@@ -395,9 +408,9 @@ class SpectralAdamW(_SpectralBase):
                 if t == 1 or t % cfg.refresh == 0:
                     t1 = self._now(p.device) if prof else 0.0
                     if m_spec:
-                        st['k_req_proxy_m'], st['churn_m'] = self._refresh(m, cg * (1 - b1))
+                        st['k_req_proxy_m'], st['churn_m'] = self._refresh(m, cg * (1 - b1), cg)
                     if v_spec:
-                        st['k_req_proxy_v'], st['churn_v'] = self._refresh(v, cg2 * (1 - b2))
+                        st['k_req_proxy_v'], st['churn_v'] = self._refresh(v, cg2 * (1 - b2), cg2)
                     if prof:
                         self._add_phase('refresh', self._now(p.device) - t1)
 

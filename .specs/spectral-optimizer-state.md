@@ -1350,6 +1350,53 @@ every axis.
    but SGD-M dense is itself 61% worse than AdamW dense (3.5516 vs 2.2018), so a
    compressible momentum buys nothing anyone wants.
 
+### Correction: the screen never approached K = N, and its K labels overstate K
+
+Two issues surfaced when the sweep's reported state sizes were reconciled against
+`K_max`.
+
+**The capacity controller was under-provisioning.** It compared retained
+coefficients (which hold accumulated EMAs) against a *one-step* gradient
+contribution `(1-b).T(g)`. For an EMA `m <- b.m + (1-b).g` a persistent gradient
+converges to `g` itself, so the out-of-set energy looked 10–20x smaller than it
+is, and `K` settled at roughly half its cap. Backed out of the reported state
+sizes:
+
+| config | `K_max` | K/N actually used |
+|---|---:|---:|
+| AdamW m+v TopK | 5% | 2.6% |
+| AdamW m+v TopK | 10% | 5.2% |
+| AdamW m+v TopK | 25% | 12.6% |
+| AdamW v-only TopK | 1% / 5% / 10% | 0.56% / 0.56% / 0.68% |
+
+Fixed: the spectrum estimate now uses the steady-state magnitude
+(`T(g)` for Adam's moments, `T(g)/(1-beta)` for SGD momentum) while newly
+activated coefficients are still seeded with the true one-step contribution. All
+numbers in this section predate the fix; the verdict is unaffected, since larger
+`K` costs more memory for the modest quality gain the curve already shows.
+
+**A claim of mine was wrong.** I reported the three v-only runs as evidence that
+training quality is flat in `K`. They are not: their actual `K/N` was
+0.56% / 0.56% / 0.68% — nearly identical — so they never tested `K` at all. The
+flat-in-`K` finding rests solely on the probe's offline sweep (section 42), which
+truncates at exact budgets with no controller involved and is unaffected.
+
+**The convergence region was never measured.** The screen capped at 25% and
+reached 12.6%, while `K = N` is the point where the optimizer is algebraically
+AdamW. The `experiments/highk_curve.jsonl` arm fills this in with `--fixed-k` at
+K/N = 25 / 50 / 75 / 100%, where the break-even points are:
+
+```
+DCT-TopK (4B value + 4B index)   costs as much as dense state at K/N = 50%
+DCT-Low  (4B value, no index)    costs as much as dense state at K/N = 100%
+probe: m needs K/N = 73% (TopK) / 99% (Low) to retain 99% of its energy
+```
+
+Loss must return to the dense control at K/N = 1.0 — but by then TopK occupies
+1.89x the memory of the dense state it replaced. If quality only recovers past
+break-even, the method has no operating region at all, which is the structural
+form of this negative result.
+
 ### What would have to be true for this to work
 
 The measurements point at a specific, falsifiable requirement rather than a
