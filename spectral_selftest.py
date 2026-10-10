@@ -12,18 +12,23 @@ differs from dense training is truncation -- which is the entire premise of the
 experiment. If it fails, every downstream quality number is measuring a bug
 instead of measuring compression.
 
-Everything runs on tiny tensors in float64 on the CPU: seconds, no GPU, no data.
+The first sections run on tiny tensors in float64 on the CPU. The last ones run
+at the micro model's real shapes in fp32 -- the precision training actually uses
+-- on the GPU when one is present, and check what fp64 cannot: rounding at the
+training dtype, that the reported memory is the memory actually held, and how
+long a step takes. Under a minute, no data.
 """
 
 import math
 import sys
+import time
 
 import torch
 
 from spectral.metrics import (energy_profile, jaccard_churn, k_required, spectral_entropy,
                              state_error, update_fidelity)
 from spectral.optim import SpectralAdamW, SpectralConfig, SpectralSGD
-from spectral.state import KController
+from spectral.state import KController, SpectralState
 from spectral.transforms import DCT2D, dct, dct2, idct, idct2
 
 FAILURES = []
@@ -88,6 +93,17 @@ def test_transforms():
     o = dct2d.default_order((4, 5), torch.device('cpu'))
     check("low-frequency order starts at DC and is a permutation",
           int(o[0]) == 0 and sorted(o.tolist()) == list(range(20)))
+    pre = dct2d.low_prefix((4, 5), 7, torch.device('cpu'))
+    check("low prefix == first K of the order, stored as int32",
+          pre.dtype == torch.int32 and pre.tolist() == o[:7].tolist())
+
+    # the 1D transform along a non-last axis, and batching over leading axes
+    # (both Adam moments go through ONE batched call) must be the same transform
+    check("DCT along dim -2 == matrix DCT", rel(dct(w, -2), dct_matrix(m) @ w) < 1e-11)
+    check("IDCT along dim -2 inverts it", rel(idct(dct(w, -2), -2), w) < 1e-12)
+    stacked = dct2(torch.stack([w, g]))
+    check("batched 2D DCT == per-matrix 2D DCT",
+          rel(stacked[0], dct2(w)) < 1e-14 and rel(stacked[1], dct2(g)) < 1e-14)
 
 
 # ---------------- metrics + controller ----------------
@@ -148,7 +164,8 @@ def _run(opt_factory, shapes, grads, spectral, wd, seed=3):
 
 def full_k_cfg(**kw):
     """K = N: keep every coefficient, so truncation is the only thing switched off."""
-    return SpectralConfig(state='dct', selection='topk', kmax_frac=1.0, kmin_frac=1.0,
+    kw.setdefault('selection', 'topk')
+    return SpectralConfig(state='dct', kmax_frac=1.0, kmin_frac=1.0,
                           dynamic=False, refresh=1, mode='perf', telemetry_interval=10 ** 9, **kw)
 
 
@@ -184,6 +201,14 @@ def test_equivalence():
     check("spectral AdamW at K=N == torch.optim.AdamW", err < 1e-8, f"max rel {err:.2e}")
     err = max(rel(a, b) for a, b in zip(monly, ref))
     check("spectral AdamW (m-only) at K=N == torch.optim.AdamW", err < 1e-8, f"max rel {err:.2e}")
+    vonly = _run(lambda g: SpectralAdamW(g, lr=lr, betas=betas, eps=eps, weight_decay=wd,
+                                         cfg=full_k_cfg(v_only=True)), shapes, grads, True, wd)
+    err = max(rel(a, b) for a, b in zip(vonly, ref))
+    check("spectral AdamW (v-only) at K=N == torch.optim.AdamW", err < 1e-8, f"max rel {err:.2e}")
+    low = _run(lambda g: SpectralAdamW(g, lr=lr, betas=betas, eps=eps, weight_decay=wd,
+                                       cfg=full_k_cfg(selection='low')), shapes, grads, True, wd)
+    err = max(rel(a, b) for a, b in zip(low, ref))
+    check("spectral AdamW (DCT-Low) at K=N == torch.optim.AdamW", err < 1e-8, f"max rel {err:.2e}")
 
     # non-eligible params must fall back to the exact dense rule inside the same optimizer
     mixed = _run(lambda g: SpectralAdamW(g, lr=lr, betas=betas, eps=eps, weight_decay=wd,
@@ -271,9 +296,9 @@ def test_truncation():
         return opt, opt.state[params[0]]['m']
 
     _, low = churn_run('low', kmin_frac=0.01)
-    prefix = low.order[:low.k].sort().values
+    prefix = DCT2D().default_order((32, 32), torch.device('cpu'))[:low.k]
     check("DCT-Low active set is always a prefix of the fixed order",
-          bool(torch.equal(low.idx, prefix)) and low.n_evicted == 0,
+          low.idx.tolist() == prefix.tolist() and low.n_evicted == 0,
           f"K={low.k}, activated {low.n_activated}, evicted {low.n_evicted}")
 
     _, fixed = churn_run('low', kmin_frac=0.25)
@@ -307,12 +332,342 @@ def test_truncation():
           bool((idct2(keep.view(32, 32)) < 0).any()))
 
 
+# ---------------- the truncated path, exactly ----------------
+def test_truncated_exact():
+    """K < N, checked against an independent reference rather than a trend.
+
+    With DCT-Low at fixed K the active set never moves, so by linearity the held
+    coefficients must be EXACTLY the first K low-frequency coefficients of the
+    dense moments, and every parameter update must be EXACTLY AdamW run on their
+    truncated reconstructions. This is the truncated arithmetic itself -- the
+    K = N gate cannot see a bug that only bites when coefficients are dropped.
+    """
+    print("truncated path == independent truncated-AdamW reference")
+    shape, steps, frac = (24, 40), 25, 0.1
+    lr, wd, (b1, b2), eps, floor = 0.01, 0.1, (0.9, 0.95), 1e-8, 1e-6
+    grads = _grad_stream([shape], steps, seed=21)
+    for mode in ('both', 'v_only', 'm_only'):
+        out = _run(lambda g: SpectralAdamW(
+            g, lr=lr, betas=(b1, b2), eps=eps, weight_decay=wd,
+            cfg=SpectralConfig(state='dct', selection='low', kmax_frac=frac, kmin_frac=frac,
+                               dynamic=False, refresh=1, v_floor=floor,
+                               v_only=(mode == 'v_only'), m_only=(mode == 'm_only'),
+                               telemetry_interval=10 ** 9)), [shape], grads, True, wd)
+        k = int(round(frac * shape[0] * shape[1]))
+        keep = DCT2D().default_order(shape, torch.device('cpu'))[:k]
+
+        def trunc(x):
+            c = dct2(x).reshape(-1)
+            kept = torch.zeros_like(c)
+            kept[keep] = c[keep]
+            return idct2(kept.view(shape))
+
+        p = torch.randn(*shape, generator=torch.Generator().manual_seed(3), dtype=torch.float64) * 0.02
+        m = torch.zeros(shape, dtype=torch.float64)
+        v = torch.zeros(shape, dtype=torch.float64)
+        for t, (gr,) in enumerate(grads, start=1):
+            m = b1 * m + (1 - b1) * gr
+            v = b2 * v + (1 - b2) * gr * gr
+            m_hat = trunc(m) if mode != 'v_only' else m
+            v_hat = trunc(v).clamp_min(floor) if mode != 'm_only' else v
+            p = p * (1 - lr * wd)
+            p = p - lr * (m_hat / (1 - b1 ** t)) / ((v_hat / (1 - b2 ** t)).sqrt() + eps)
+        err = rel(out[0].detach(), p)
+        check(f"DCT-Low fixed K=10% ({mode}) == truncated-AdamW reference", err < 1e-10,
+              f"max rel {err:.2e}")
+
+
+def test_reselect():
+    """Active-set moves: survivors keep their history, newcomers get this step,
+    evictions are counted -- checked element by element."""
+    print("active-set re-selection")
+    cpu = torch.device('cpu')
+    t = DCT2D()
+    ctrl = KController(4, 4)
+    s = SpectralState((4, 4), t, 'topk', ctrl, None, cpu, dtype=torch.float64)
+    s.idx = torch.tensor([1, 3, 5, 7], dtype=torch.int32)
+    s.coef = torch.tensor([10., 30., 50., 70.], dtype=torch.float64)
+    ref = torch.zeros(16, dtype=torch.float64)
+    ref[[3, 7, 9, 11]] = torch.tensor([4., 3., 2., 1.], dtype=torch.float64)
+    seed = torch.arange(16, dtype=torch.float64) * -1.0
+    churn = s.reselect(ref, 4, seed=seed)
+    held = dict(zip(s.idx.tolist(), s.coef.tolist()))
+    check("TopK keeps survivors' accumulated value", held[3] == 30. and held[7] == 70.)
+    check("TopK seeds newcomers with this step's contribution", held[9] == -9. and held[11] == -11.)
+    check("TopK counts evictions and Jaccard churn",
+          s.n_evicted == 2 and s.n_activated == 2 and abs(churn - (1 - 2 / 6)) < 1e-12)
+    check("TopK indices stay sorted int32",
+          s.idx.dtype == torch.int32 and s.idx.tolist() == sorted(s.idx.tolist()))
+
+    ctrl = KController(2, 6)
+    pre = t.low_prefix((4, 4), 6, cpu)
+    s = SpectralState((4, 4), t, 'low', ctrl, pre, cpu, dtype=torch.float64)
+    s.coef = torch.tensor([1., 2.], dtype=torch.float64)
+    s.reselect(None, 5, seed=seed)
+    check("DCT-Low growth keeps the prefix in place and seeds only the tail",
+          s.idx.tolist() == pre[:5].tolist() and s.coef[:2].tolist() == [1., 2.]
+          and s.coef[2:].tolist() == [float(-i) for i in pre[2:5].tolist()] and s.n_evicted == 0)
+    s.reselect(None, 3, seed=seed)
+    check("DCT-Low shrink drops only the tail",
+          s.idx.tolist() == pre[:3].tolist() and s.coef.tolist()[:2] == [1., 2.] and s.n_evicted == 2)
+    check("DCT-Low holds no per-state index storage",
+          s.idx.data_ptr() == pre.data_ptr() and s.persistent_bytes() == 3 * 8 + 16)
+
+
+def test_controller_proxy():
+    """Regression for the under-provisioning bug (spec section 43, correction).
+
+    Under a persistent gradient an EMA converges to the gradient itself, so the
+    true state's `K_required` is that of `T(g)` (for `m`) and `T(g^2)` (for `v`).
+    The controller must end at or above it -- the old proxy compared retained
+    EMAs with a one-step `(1-b).T(g)` and settled at roughly half. It may sit
+    above by up to the hysteresis band (shrink only below 0.75 . K).
+    """
+    print("capacity controller sizes K from the steady-state spectrum")
+    shape, tau = (32, 32), 0.99
+    gen = torch.Generator().manual_seed(9)
+    g = torch.randn(*shape, generator=gen, dtype=torch.float64) * torch.linspace(0.1, 3, 32).view(32, 1)
+    params = [torch.nn.Parameter(torch.zeros(*shape, dtype=torch.float64))]
+    opt = SpectralAdamW(_groups(params, ['blocks.0.fc.weight'], True, 0.0), lr=1e-3,
+                        cfg=SpectralConfig(state='dct', selection='topk', kmax_frac=1.0,
+                                           kmin_frac=0.01, tau=tau, refresh=1, v_floor=1e-12,
+                                           telemetry_interval=10 ** 9))
+    for _ in range(300):
+        params[0].grad = g.clone()
+        opt.step()
+    st = opt.state[params[0]]
+    for label, target in (('m', g), ('v', g * g)):
+        need = k_required(dct2(target), tau)
+        k = st[label].k
+        check(f"controller K for {label} covers the steady-state requirement",
+              need <= k <= math.ceil(need / 0.75) + 1, f"K={k}, K_required(steady)={need}")
+
+
+# ---------------- training shapes, training dtype ----------------
+MICRO_SHAPES = [(576, 192), (192, 192), (768, 192), (192, 768)]   # qkv, proj, fc, out
+
+
+def _device():
+    return torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+
+def test_training_precision():
+    """fp32 at the shapes the optimizer actually sees (fp64 above hides rounding)."""
+    dev = _device()
+    print(f"fp32 at training shapes ({dev})")
+    worst = {'fwd': 0.0, 'rt': 0.0, 'parseval': 0.0, 'batch': 0.0}
+    for shape in MICRO_SHAPES:
+        x = torch.randn(*shape, device=dev)
+        ref = (dct_matrix(shape[0]).to(dev) @ x.double() @ dct_matrix(shape[1]).to(dev).T)
+        c = dct2(x)
+        worst['fwd'] = max(worst['fwd'], rel(c.double(), ref))
+        worst['rt'] = max(worst['rt'], rel(idct2(c), x))
+        worst['parseval'] = max(worst['parseval'],
+                                abs(float(c.double().pow(2).sum() / x.double().pow(2).sum()) - 1))
+        worst['batch'] = max(worst['batch'], rel(dct2(torch.stack([x, x * x]))[1], dct2(x * x)))
+    check("fp32 DCT == fp64 matrix DCT at every training shape", worst['fwd'] < 2e-6,
+          f"max rel {worst['fwd']:.2e}")
+    check("fp32 round trip at every training shape", worst['rt'] < 2e-6, f"max rel {worst['rt']:.2e}")
+    check("fp32 Parseval at every training shape", worst['parseval'] < 1e-5,
+          f"max rel {worst['parseval']:.2e}")
+    check("batched == separate, bit for bit", worst['batch'] == 0.0, f"max rel {worst['batch']:.2e}")
+
+    # K = N in fp32 against torch.optim.AdamW in fp32. Gradients are linear-layer
+    # shaped (row x column scales) at a realistic magnitude.
+    def grad_stream(steps, spread, bounded=False):
+        """`bounded` keeps |g| away from zero (v spans ~6 decades), so the
+        representational limit below cannot fire and K = N must be exact."""
+        gen = torch.Generator(device=dev).manual_seed(2)
+        out = []
+        for _ in range(steps):
+            row = []
+            for sh in MICRO_SHAPES:
+                r = (torch.randn(sh[0], 1, device=dev, generator=gen) * spread).exp()
+                c = (torch.randn(1, sh[1], device=dev, generator=gen) * spread).exp()
+                z = torch.randn(*sh, device=dev, generator=gen)
+                if bounded:
+                    z = z.sign() * (0.5 + z.abs().clamp(max=2.0))
+                row.append(z * r * c * 1e-3)
+            out.append(row)
+        return out
+
+    def run(factory, grads, dtype=torch.float32):
+        gen = torch.Generator(device=dev).manual_seed(1)
+        params = [torch.nn.Parameter((torch.randn(*sh, device=dev, generator=gen) * 0.02).to(dtype))
+                  for sh in MICRO_SHAPES]
+        opt = factory(_groups(params, [f'blocks.{i}.w' for i in range(len(params))], True, 0.1))
+        for row in grads:
+            for p, gr in zip(params, row):
+                p.grad = gr.to(dtype).clone()
+            opt.step()
+        return [p.detach().double() for p in params]
+
+    gen = torch.Generator(device=dev).manual_seed(1)
+    init = [(torch.randn(*sh, device=dev, generator=gen) * 0.02).double() for sh in MICRO_SHAPES]
+
+    def drift(a, b):          # worst element error, relative to that tensor's total movement
+        return max(float((x - y).abs().max() / (y - y0).abs().max()) for x, y, y0 in zip(a, b, init))
+
+    def off(a, b):            # fraction of elements whose error exceeds 1% of their own movement
+        n = sum(x.numel() for x in a)
+        return sum(int(((x - y).abs() > 0.01 * (y - y0).abs()).sum()) for x, y, y0 in zip(a, b, init)) / n
+
+    torch_adamw = lambda g: torch.optim.AdamW(g[0]['params'], lr=1e-3, betas=(0.9, 0.95),
+                                              weight_decay=0.1)
+    spectral = lambda **kw: (lambda g: SpectralAdamW(g, lr=1e-3, betas=(0.9, 0.95), weight_decay=0.1,
+                                                      cfg=full_k_cfg(**kw)))
+
+    # The algorithm at the training shapes: in fp64, K = N must be AdamW exactly
+    # (on gradients bounded away from zero -- see the limit measured next).
+    grads = grad_stream(100, 0.5, bounded=True)
+    ref64 = run(torch_adamw, grads, torch.float64)
+    for name, kw in (('m+v topk', {}), ('m+v low', dict(selection='low')),
+                     ('m-only', dict(m_only=True)), ('v-only', dict(v_only=True))):
+        d = drift(run(spectral(**kw), grads, torch.float64), ref64)
+        check(f"fp64 K=N {name} == torch AdamW at training shapes", d < 1e-9,
+              f"worst element error {d:.2e} of its movement")
+
+    # Gaussian gradients have entries arbitrarily close to zero, and then even
+    # fp64 is not exact: the worst element's step-1 g^2 sits ~14 decades under
+    # the tensor's maximum, at the edge of fp64 resolution.
+    grads = grad_stream(100, 0.5)
+    d = drift(run(spectral(), grads, torch.float64), run(torch_adamw, grads, torch.float64))
+    print(f"  [--] fp64 K=N m+v, Gaussian gradients (unbounded below): worst element error {d:.2e}")
+
+    # fp32 is NOT exact even at K = N, for either moment, and this is measured
+    # rather than gated. Each fp32 coefficient carries ~1e-7 relative rounding,
+    # and that error lands on every element at the scale of the tensor's
+    # LARGEST values, while AdamW divides each element by its OWN sqrt(v). An
+    # element ~7 decades under the maximum is therefore swamped: for `v` its
+    # reconstruction reaches zero and the step is set by the floor (or by eps,
+    # at floor 0). No transform precision fixes it -- only fp64 coefficients (2x
+    # the memory) or a floor (a different update rule). Dense fp32 rounds each
+    # element relative to ITSELF, which is the baseline printed first. The effect
+    # on real micro-model training is measured in spec section 43.
+    for spread, label in ((0.5, 'moderate'), (1.0, 'heavy-tailed')):
+        grads = grad_stream(100, spread)
+        ref64 = run(torch_adamw, grads, torch.float64)
+        base = run(torch_adamw, grads)
+        print(f"  [--] {label} gradients, dense torch AdamW fp32 vs fp64: "
+              f"{off(base, ref64):.2%} of elements off by >1%, worst {drift(base, ref64):.2e}")
+        for name, kw in (('m-only', dict(m_only=True)), ('m+v floor 0', {}),
+                         ('m+v floor 1e-8', dict(v_floor=1e-8))):
+            out = run(spectral(**kw), grads)
+            print(f"  [--] {label} gradients, spectral K=N {name} fp32 vs fp64 AdamW: "
+                  f"{off(out, ref64):.2%} of elements off by >1%, worst {drift(out, ref64):.2e}")
+
+    # nothing goes NaN/inf under heavy truncation, a floor, or an all-zero gradient
+    params = [torch.nn.Parameter(torch.randn(*sh, device=dev) * 0.02) for sh in MICRO_SHAPES]
+    opt = SpectralAdamW(_groups(params, [f'blocks.{i}.w' for i in range(4)], True, 0.1), lr=1e-3,
+                        cfg=SpectralConfig(state='dct', selection='topk', kmax_frac=0.01,
+                                           v_floor=1e-8, refresh=10, telemetry_interval=10 ** 9))
+    for t, row in enumerate(grad_stream(50, 0.5)):
+        for p, gr in zip(params, row):
+            p.grad = torch.zeros_like(gr) if t % 10 == 3 else gr.clone()
+        opt.step()
+    check("K/N=1% TopK with floor: finite after 50 steps incl. all-zero gradients",
+          all(bool(torch.isfinite(p).all()) for p in params))
+
+
+def test_memory_accounting():
+    """The reported persistent bytes must be the bytes actually held.
+
+    Walks every tensor the optimizer keeps between steps and sums its real
+    storage. A shared DCT-Low prefix is counted once. Nothing per-state may be
+    dense-sized except a moment that is deliberately dense (m-only / v-only).
+    """
+    dev = _device()
+    print(f"memory accounting == bytes actually held ({dev})")
+    for name, kw in (('m+v low 5%', dict(selection='low')),
+                     ('m+v topk 5%', dict(selection='topk')),
+                     ('v-only topk 5%', dict(selection='topk', v_only=True)),
+                     ('m-only low 5%', dict(selection='low', m_only=True))):
+        params = [torch.nn.Parameter(torch.randn(*sh, device=dev) * 0.02)
+                  for sh in MICRO_SHAPES for _ in range(4)]
+        opt = SpectralAdamW(_groups(params, [f'blocks.{i}.w' for i in range(len(params))], True, 0.1),
+                            lr=1e-3, cfg=SpectralConfig(state='dct', kmax_frac=0.05, kmin_frac=0.01,
+                                                        refresh=1, v_floor=1e-8,
+                                                        telemetry_interval=10 ** 9, **kw))
+        for _ in range(3):
+            for p in params:
+                p.grad = torch.randn_like(p) * 1e-3
+            opt.step()
+        held, shared, n_states, dense_sized = 0, {}, 0, 0
+        for p in params:
+            for key in ('m', 'v'):
+                s = opt.state[p][key]
+                if isinstance(s, SpectralState):
+                    n_states += 1
+                    held += s.coef.numel() * s.coef.element_size()
+                    if s.prefix is None:
+                        held += s.idx.numel() * s.idx.element_size()
+                    else:
+                        shared[s.prefix.data_ptr()] = s.prefix.numel() * s.prefix.element_size()
+                    dense_sized += int(max(s.coef.numel(), s.idx.numel()) >= p.numel())
+                else:
+                    held += s.numel() * s.element_size()
+        held += sum(shared.values())
+        rep = opt.memory_report()
+        reported = rep['persistent_state_bytes'] - 16 * n_states
+        check(f"{name}: reported state == tensors held", reported == held,
+              f"reported {reported} B vs held {held} B, ratio to dense {rep['state_ratio']:.3f}")
+        check(f"{name}: no dense-sized spectral buffer", dense_sized == 0)
+
+
+def test_throughput():
+    """Not a gate -- hardware dependent. Measured so that efficiency claims rest
+    on a number: transform cost at training shapes and whole optimizer steps."""
+    dev = _device()
+    print(f"throughput, informational ({dev}; {torch.cuda.get_device_name(dev) if dev.type == 'cuda' else 'cpu'})")
+
+    def timed(fn, reps=50):
+        for _ in range(5):
+            fn()
+        if dev.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            fn()
+        if dev.type == 'cuda':
+            torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / reps
+
+    x = torch.randn(768, 192, device=dev)
+    xx = torch.stack([x, x])
+    print(f"  [--] dct2 {timed(lambda: dct2(x)) * 1e6:.0f} us, idct2 {timed(lambda: idct2(x)) * 1e6:.0f} us, "
+          f"batched pair dct2 {timed(lambda: dct2(xx)) * 1e6:.0f} us  (768x192 fp32)")
+
+    def step_time(factory):
+        params = [torch.nn.Parameter(torch.randn(*sh, device=dev) * 0.02)
+                  for sh in MICRO_SHAPES for _ in range(4)]
+        opt = factory(_groups(params, [f'blocks.{i}.w' for i in range(len(params))], True, 0.1))
+        for p in params:
+            p.grad = torch.randn_like(p) * 1e-3
+        return timed(opt.step, reps=30)
+
+    base = step_time(lambda g: torch.optim.AdamW(g[0]['params'], lr=1e-3, betas=(0.9, 0.95)))
+    print(f"  [--] torch AdamW step over the 16 micro matrices: {base * 1e3:.2f} ms")
+    for name, kw in (('m+v low 5%', dict(selection='low')), ('m+v topk 5%', dict(selection='topk')),
+                     ('v-only topk 5%', dict(selection='topk', v_only=True))):
+        t = step_time(lambda g, kw=kw: SpectralAdamW(
+            g, lr=1e-3, betas=(0.9, 0.95),
+            cfg=SpectralConfig(state='dct', kmax_frac=0.05, kmin_frac=0.05, dynamic=False,
+                               refresh=10, v_floor=1e-8, telemetry_interval=10 ** 9, **kw)))
+        print(f"  [--] spectral {name}: {t * 1e3:.2f} ms  ({t / base:.1f}x torch AdamW)")
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     test_transforms()
     test_metrics()
     test_equivalence()
     test_truncation()
+    test_truncated_exact()
+    test_reselect()
+    test_controller_proxy()
+    test_training_precision()
+    test_memory_accounting()
+    test_throughput()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

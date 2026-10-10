@@ -217,10 +217,14 @@ for ~40% of throughput, and its quality is flat in K (1%, 5% and 10% of
 coefficients are indistinguishable), so the spectral representation is not what
 makes it work. Adafactor's factored second moment does
 the same job with 3x less storage, no transform cost and no positivity problem.
-Full numbers, mechanism and the surprises (DCT-Low beats DCT-TopK for training
-even though TopK reconstructs better) are in
+Compressing both moments, the convergence curve finds the first point within 5%
+of dense at DCT-Low K/N = 75% (+2.85% val loss), which saves only 14% of optimizer
+state, costs 28% of throughput and raises peak GPU memory; within 1% there is no
+point that saves memory at all. Full numbers, mechanism and the surprises (DCT-Low
+beats DCT-TopK for training even though TopK reconstructs better; fp32 spectral
+state is not exactly AdamW even at K = N) are in
 [`.specs/spectral-optimizer-state.md`](.specs/spectral-optimizer-state.md),
-sections 42-43.
+sections 42-44.
 
 **Start with the probe.** It trains with an ordinary dense AdamW and only
 *measures*, comparing four bases — best-K DCT, low-frequency DCT, the state's own

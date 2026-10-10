@@ -119,21 +119,24 @@ class _SpectralBase(torch.optim.Optimizer):
         self.phase[name] += dt
 
     # ---------------- setup ----------------
-    def _scratch_for(self, p):
-        key = (tuple(p.shape), p.device)
+    def _scratch_for(self, p, count=1):
+        """Shared dense buffer for reconstruction; `count` stacked copies when
+        both Adam moments are synthesized in one batched inverse transform."""
+        key = (tuple(p.shape), p.device, count)
         buf = self._scratch.get(key)
         if buf is None:
-            buf = torch.zeros(p.numel(), device=p.device, dtype=p.dtype)
+            buf = torch.zeros(count * p.numel(), device=p.device, dtype=p.dtype)
             self._scratch[key] = buf
-        return buf.view_as(p)
+        return buf.view(count, *p.shape) if count > 1 else buf.view_as(p)
 
     def _new_spectral(self, p):
         n, cfg = p.numel(), self.cfg
         k_max = max(1, min(n, int(round(cfg.kmax_frac * n))))
         k_min = k_max if not cfg.dynamic else max(1, min(k_max, int(round(cfg.kmin_frac * n))))
         ctrl = KController(k_min, k_max, cfg.shrink_ratio, cfg.shrink_patience)
-        order = self.transform.default_order(p.shape, p.device)
-        return SpectralState(p.shape, self.transform, cfg.selection, ctrl, order,
+        prefix = (self.transform.low_prefix(p.shape, k_max, p.device)
+                  if cfg.selection == 'low' else None)
+        return SpectralState(p.shape, self.transform, cfg.selection, ctrl, prefix,
                              p.device, dtype=p.dtype)
 
     def _is_spectral(self, p, group):
@@ -170,12 +173,18 @@ class _SpectralBase(torch.optim.Optimizer):
         """
         ref = (contrib if ref_contrib is None else ref_contrib).abs()
         ref[s.idx] = s.coef.abs()
-        order = s.order if s.selection == 'low' else None
+        order = self._full_order(s)
         cum, total = energy_profile(ref, order)
         k_req = k_required(None, self.cfg.tau, cum=cum) if total > 0 else s.ctrl.k_min
         k = s.ctrl.update(k_req) if self.cfg.dynamic else s.ctrl.k_max
         seed = contrib if self.cfg.seed_new_from_grad else None
         return k_req, s.reselect(ref, k, seed=seed)
+
+    def _full_order(self, s):
+        """The full selection order, built transiently: `K_required` under DCT-Low
+        is measured along the whole low-frequency order, which is one int per
+        coefficient and is therefore never kept between steps."""
+        return self.transform.default_order(s.shape, s.coef.device) if s.selection == 'low' else None
 
     # ---------------- telemetry ----------------
     def _row(self, st, s, label, shadow=None, hat=None, fid=None, extras=None):
@@ -195,7 +204,7 @@ class _SpectralBase(torch.optim.Optimizer):
         }
         if shadow is not None:
             c = self.transform.analyze(shadow).reshape(-1)
-            cum, _ = energy_profile(c, s.order if s.selection == 'low' else None)
+            cum, _ = energy_profile(c, self._full_order(s))
             k_req = k_required(None, self.cfg.tau, cum=cum)
             ent, keff = spectral_entropy(c)
             row.update({
@@ -219,6 +228,7 @@ class _SpectralBase(torch.optim.Optimizer):
         """Persistent optimizer-state bytes, spectral vs dense-equivalent."""
         spec_bytes = dense_equiv = fallback = 0
         n_spec = n_total = 0
+        prefixes = {}                       # shared DCT-Low prefixes, counted once each
         for group in self.param_groups:
             for p in group['params']:
                 st = self.state.get(p, {})
@@ -233,15 +243,20 @@ class _SpectralBase(torch.optim.Optimizer):
                     s = st.get(key)
                     if isinstance(s, SpectralState):
                         spec_bytes += s.persistent_bytes()
+                        if s.prefix is not None:
+                            prefixes[s.prefix.data_ptr()] = s.prefix.numel() * s.prefix.element_size()
                     elif torch.is_tensor(s):
                         b = s.numel() * s.element_size()
                         spec_bytes += b if spectral else 0        # m_only's dense v
                         fallback += 0 if spectral else b
+        prefix_bytes = sum(prefixes.values())
+        spec_bytes += prefix_bytes
         scratch = sum(b.numel() * b.element_size() for b in self._scratch.values())
         total = spec_bytes + fallback
         return {
             'persistent_state_bytes': total,
             'spectral_state_bytes': spec_bytes,
+            'low_prefix_bytes': prefix_bytes,
             'dense_fallback_state_bytes': fallback,
             'dense_equivalent_bytes': dense_equiv,
             'state_ratio': total / max(1, dense_equiv),
@@ -390,9 +405,13 @@ class SpectralAdamW(_SpectralBase):
                 # `v_only` are the same code path with a different allocation --
                 # and a dense moment costs no transform at all.
                 m_spec, v_spec = isinstance(m, SpectralState), isinstance(v, SpectralState)
+                both = m_spec and v_spec
                 t0 = self._now(p.device) if prof else 0.0
-                cg = self.transform.analyze(g).reshape(-1) if m_spec else None
-                cg2 = self.transform.analyze(g * g).reshape(-1) if v_spec else None
+                if both:                                        # one batched transform for g and g^2
+                    cg, cg2 = self.transform.analyze(torch.stack([g, g * g])).reshape(2, -1).unbind(0)
+                else:
+                    cg = self.transform.analyze(g).reshape(-1) if m_spec else None
+                    cg2 = self.transform.analyze(g * g).reshape(-1) if v_spec else None
                 if prof:
                     self._add_phase('transform', self._now(p.device) - t0)
 
@@ -414,10 +433,16 @@ class SpectralAdamW(_SpectralBase):
                     if prof:
                         self._add_phase('refresh', self._now(p.device) - t1)
 
-                buf = self._scratch_for(p)
                 t2 = self._now(p.device) if prof else 0.0
-                m_hat = m.reconstruct(buf) if m_spec else m
-                v_raw = v.reconstruct(buf) if v_spec else None
+                if both:                                        # one batched inverse for m and v
+                    buf = self._scratch_for(p, 2)
+                    m.scatter_into(buf[0].view(-1))
+                    v.scatter_into(buf[1].view(-1))
+                    m_hat, v_raw = self.transform.synthesize(buf).unbind(0)
+                else:
+                    buf = self._scratch_for(p)
+                    m_hat = m.reconstruct(buf) if m_spec else m
+                    v_raw = v.reconstruct(buf) if v_spec else None
                 if prof:
                     self._add_phase('inverse', self._now(p.device) - t2)
                     self.phase_samples += 1

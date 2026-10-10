@@ -188,6 +188,13 @@ def main(argv=None):
     batch_gen = torch.Generator().manual_seed(a.seed)
     get_batch = make_get_batch(d['train_data'], d['val_data'], scale['block_size'],
                                scale['batch_size'], device, gen=batch_gen)
+    # Evaluation draws from its OWN stream, re-seeded at every evaluation: the
+    # training batch order is then independent of the eval schedule, and every
+    # evaluation of every run scores the same windows (so differences between
+    # runs are not partly differences between eval samples).
+    eval_gen = torch.Generator()
+    get_eval_batch = make_get_batch(d['train_data'], d['val_data'], scale['block_size'],
+                                    scale['batch_size'], device, gen=eval_gen)
     chars_per_token = d['chars_per_token']
 
     # ---------------- model ----------------
@@ -228,11 +235,12 @@ def main(argv=None):
     @torch.no_grad()
     def evaluate():
         model.eval()
+        eval_gen.manual_seed(a.seed + 1)
         out = {}
         for split in ('train', 'val'):
             losses = torch.zeros(a.eval_iters)
             for i in range(a.eval_iters):
-                x, y = get_batch(split)
+                x, y = get_eval_batch(split)
                 with torch.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
                     _, loss = model(x, y)
                 losses[i] = loss.item()
@@ -312,6 +320,7 @@ def main(argv=None):
     summary = {
         'name': name,
         'config': {**vars(a), 'lr': lr, 'min_lr': min_lr, 'device': device, 'bf16': use_amp,
+                   'gpu': torch.cuda.get_device_name() if device == 'cuda' else None,
                    'spectral': cfg.dict(), 'scale_dims': scale},
         'model': {'params': n_params, 'spectral_coverage': coverage,
                   'vocab_size': d['vocab_size'], 'chars_per_token': chars_per_token},

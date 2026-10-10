@@ -58,20 +58,30 @@ class KController:
 class SpectralState:
     """One optimizer-state tensor held as `K` spectral coefficients.
 
-    `idx` is kept SORTED at all times: the sorted invariant is what makes
-    carry-over on resize an O(K log K) `searchsorted` instead of a dense
-    scatter, and it makes churn measurable for free.
+    The active set is stored differently per policy, and the difference is the
+    memory story:
+
+    * TopK keeps its own `idx`: int32, kept SORTED at all times. The sorted
+      invariant is what makes carry-over on resize an O(K log K) `searchsorted`
+      instead of a dense scatter, and it makes churn measurable for free.
+    * DCT-Low keeps no indices of its own. `idx` is a slice of `prefix`, the
+      shared int32 low-frequency prefix of length `K_max` (one copy per shape,
+      see `DCT2D.low_prefix`), so the active set is always exactly the first `K`
+      entries of the fixed order and `coef[i]` belongs to `prefix[i]`.
     """
 
-    def __init__(self, shape, transform, selection, ctrl, order, device, dtype=torch.float32):
+    def __init__(self, shape, transform, selection, ctrl, prefix, device, dtype=torch.float32):
         self.shape = tuple(shape)
         self.numel = int(shape[0] * shape[1])
         self.transform = transform
         self.selection = selection
         self.ctrl = ctrl
-        self.order = order                       # deterministic priority (DCT-Low)
-        init = order[:ctrl.k_cur] if selection == 'low' else torch.arange(ctrl.k_cur, device=device)
-        self.idx = init.sort().values.contiguous()
+        self.prefix = prefix                     # shared low-frequency prefix (DCT-Low only)
+        if selection == 'low':
+            assert prefix is not None and prefix.numel() >= ctrl.k_max
+            self.idx = prefix[:ctrl.k_cur]
+        else:
+            self.idx = torch.arange(ctrl.k_cur, device=device, dtype=torch.int32)
         self.coef = torch.zeros(self.idx.numel(), device=device, dtype=dtype)
         self.total_churn = 0.0
         self.n_refresh = 0
@@ -110,10 +120,9 @@ class SpectralState:
         implementation choice.
         """
         if self.selection == 'low':
-            new_idx = self.order[:k]
-        else:
-            new_idx = torch.topk(ref_dense_flat.abs(), k, sorted=False).indices
-        new_idx = new_idx.sort().values.contiguous()
+            return self._resize_prefix(k, seed)
+        new_idx = torch.topk(ref_dense_flat.abs(), k, sorted=False).indices
+        new_idx = new_idx.to(torch.int32).sort().values.contiguous()
         churn, n_new, n_gone = jaccard_churn(self.idx, new_idx)
         if k == self.idx.numel() and n_new == 0:
             self.n_refresh += 1
@@ -125,6 +134,29 @@ class SpectralState:
             hit = self.idx[pos] == new_idx
             new_coef[hit] = self.coef[pos[hit]]
         self.idx, self.coef = new_idx, new_coef
+        return self._count(churn, n_new, n_gone)
+
+    def _resize_prefix(self, k, seed):
+        """DCT-Low: the set is always a prefix, so resizing keeps the first
+        `min(K_old, K_new)` coefficients in place and nothing else moves. Growth
+        activates the tail; shrinking evicts it."""
+        k_old = self.idx.numel()
+        if k == k_old:
+            self.n_refresh += 1
+            return 0.0
+        keep = min(k, k_old)
+        new_idx = self.prefix[:k]
+        if k > k_old:
+            tail = (seed[new_idx[k_old:]] if seed is not None
+                    else torch.zeros(k - k_old, device=self.coef.device, dtype=self.coef.dtype))
+            new_coef = torch.cat([self.coef, tail])
+        else:
+            new_coef = self.coef[:k].clone()
+        self.idx, self.coef = new_idx, new_coef
+        churn = 1.0 - keep / max(k, k_old)       # Jaccard on nested sets: |A n B| / |A u B|
+        return self._count(churn, max(0, k - k_old), max(0, k_old - k))
+
+    def _count(self, churn, n_new, n_gone):
         self.total_churn += churn
         self.n_refresh += 1
         self.n_activated += n_new
@@ -133,16 +165,14 @@ class SpectralState:
 
     # ---------------- accounting (spec section 22) ----------------
     def persistent_bytes(self):
-        """Bytes this state actually needs to keep between steps.
+        """Bytes this state holds between steps, measured from its own tensors.
 
-        DCT-Low stores no indices: the active set is the first K entries of a
-        deterministic order, so K (one int) is the entire metadata. TopK must
-        store the index of every retained coefficient, which is the honest
-        reason a TopK coefficient costs 8 bytes where a Low coefficient costs 4.
+        TopK pays for the index of every retained coefficient (int32). DCT-Low
+        holds only coefficients plus `K`: its indices are the shared prefix,
+        which the optimizer counts once (`memory_report`) rather than per state.
         """
-        k = self.idx.numel()
-        idx_bytes = 0 if self.selection == 'low' else k * self.transform.index_bytes
-        return k * self.transform.coeff_bytes + idx_bytes + 16   # +16: K and controller scalars
+        idx_bytes = 0 if self.selection == 'low' else self.idx.numel() * self.idx.element_size()
+        return self.coef.numel() * self.coef.element_size() + idx_bytes + 16  # +16: K, controller
 
     def dense_bytes(self):
         return self.numel * 4
