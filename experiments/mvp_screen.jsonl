@@ -1,14 +1,13 @@
 # Coarse screening matrix -- spec sections 28 and 37 (MVP steps 1-9), micro scale, one seed.
-# Run with:  python train_spectral.py --sweep experiments/mvp_screen.jsonl
+# Run with:  python train_spectral.py --sweep experiments/mvp_screen.jsonl --out runs/mvp_screen
 # Start coarse; only widen around whatever turns out to be interesting. Seeds come later
 # (spec section 30) and only for configurations that survive this screen.
 #
 # Spectral AdamW entries carry v_floor=1e-8. Spec section 15's literal rule (clamp a
-# truncated v at exactly 0) leaves the AdamW denominator at eps, so those runs diverge in
-# a handful of steps and would measure the collapse rather than compression -- confirmed
-# by spectral_selftest.py. The floor is ~100x below a typical v here, so it bounds the
-# update without dominating it. One spec-literal run is kept at the end as the control
-# that shows the collapse; report any result that used a floor as having used one.
+# truncated v at exactly 0) leaves the AdamW denominator at eps, so those runs fail to
+# train and would measure the collapse rather than compression (spec section 45). The floor changes the rule by itself (+0.19% at K = N, spec
+# section 45.4). One spec-literal run is kept at the end as the control that shows the
+# collapse; report any result that used a floor as having used one.
 #
 # steps 1-2: dense controls. Every delta in the report is measured against these.
 {"name": "sgd_dense", "opt": "sgd", "state": "dense", "scale": "micro", "steps": 3000}
@@ -28,8 +27,7 @@
 #
 # The probe's asymmetry, made runnable: v carries real DCT structure (86% of its energy
 # in 1% of coefficients) while m does not, so spectral-v/dense-m is the only variant the
-# measurement actually supports. At K/N=1% it lands at 0.51x dense state -- right on the
-# section 35 bar -- so these are the runs that decide whether the bar is reachable.
+# measurement actually supports. Results: spec section 45.2.
 {"name": "adamw_dct_vonly_k001", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.01, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000}
 {"name": "adamw_dct_vonly_k005", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000}
 {"name": "adamw_dct_vonly_k010", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.1, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}

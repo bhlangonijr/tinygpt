@@ -122,9 +122,12 @@ def build_tables(runs):
         c = r['config']
         if c['state'] == 'dense':
             key = (c['opt'], c['scale'], c['seed'])
-            if key in baselines:
-                sys.exit(f"two dense controls for {key} in one root "
+            if key in baselines and (baselines[key]['quality']['final_val_loss']
+                                     != r['quality']['final_val_loss']):
+                sys.exit(f"two different dense controls for {key} in one root "
                          f"({baselines[key]['name']}, {r['name']}): one root is one sweep")
+            if key in baselines:            # an exact repeat: the baseline is unambiguous
+                continue
             baselines[key] = r
 
     main_rows, diag_rows = [], []
@@ -290,11 +293,47 @@ def make_plots(runs, out_dir):
     print(f"plots -> {out_dir}")
 
 
+def weight_drift(runs, ref_name):
+    """Element-level weight comparison of each run's `last.pt` against one run
+    in the same root (spec section 44: fp32 K = N is not exact AdamW). Counts
+    eligible block-matrix weights that differ by more than 0.1% of the tensor's
+    largest weight, and the worst such difference."""
+    import torch
+    by_name = {r['name']: r for r in runs}
+    if ref_name not in by_name:
+        sys.exit(f"--weights-vs: no run named {ref_name}")
+
+    def weights(r):
+        ck = torch.load(os.path.join(r['_dir'], 'last.pt'), map_location='cpu', weights_only=False)
+        return ck.get('model', ck)
+
+    ref = weights(by_name[ref_name])
+    out = [f"\n## Weights vs `{ref_name}` (eligible block matrices, last.pt)\n",
+           "| Run | Val loss | Elements off by >0.1% of max\\|p\\| | Worst \\|diff\\| / max\\|p\\| |",
+           "| --- | ---: | ---: | ---: |"]
+    for r in runs:
+        if r['name'] == ref_name or not os.path.exists(os.path.join(r['_dir'], 'last.pt')):
+            continue
+        w, off, total, worst = weights(r), 0, 0, 0.0
+        for k, t in ref.items():
+            if not (torch.is_tensor(t) and t.dim() == 2 and k.startswith('blocks.')):
+                continue
+            diff, scale = (w[k] - t).abs(), t.abs().max()
+            off += int((diff > 1e-3 * scale).sum())
+            total += t.numel()
+            worst = max(worst, float(diff.max() / scale))
+        out.append(f"| {r['name']} | {r['quality']['final_val_loss']:.4f} | "
+                   f"{off:,} / {total:,} ({off / total:.1%}) | {worst:.2e} |")
+    return "\n".join(out)
+
+
 def main():
     ap = argparse.ArgumentParser(description="aggregate spectral experiment runs")
     ap.add_argument('root', nargs='?', default='runs')
     ap.add_argument('--plots', action='store_true')
     ap.add_argument('--out', default=None, help='markdown output (default <root>/report.md)')
+    ap.add_argument('--weights-vs', default=None,
+                    help='also compare each run\'s last.pt weights against this run (needs checkpoints)')
     ap.add_argument('--allow-mixed', action='store_true',
                     help='report a root that mixes commits / dirty trees / GPUs (flagged in output)')
     a = ap.parse_args()
@@ -313,6 +352,8 @@ def main():
             sys.exit(f"{a.root}: runs have no recorded commit or came from a dirty tree; "
                      f"pass --allow-mixed to report them anyway")
     md = render(*build_tables(runs), prov)
+    if a.weights_vs:
+        md += "\n" + weight_drift(runs, a.weights_vs)
     print(md)
     out = a.out or os.path.join(a.root, 'report.md')
     with open(out, 'w') as f:

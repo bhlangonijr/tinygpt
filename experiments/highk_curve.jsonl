@@ -1,13 +1,12 @@
 # The convergence arm: where, as K -> N, does m+v AdamW recover dense quality, and at what memory?
-# Run with:  python train_spectral.py --sweep experiments/highk_curve.jsonl
+# Run with:  python train_spectral.py --sweep experiments/highk_curve.jsonl --out runs/highk_curve
 #
 # Every spectral run is m+v with --fixed-k, so K is exactly the stated fraction (no
 # controller). All runs share one dense control from the same sweep: same data order,
 # init, eval windows and GPU (recorded in summary.json).
 #
-# Two floor arms, because the floor is itself a change to AdamW: a 300-step check at
-# K = N (no truncation at all) measured v_floor = 1e-8 at +0.44% val loss vs dense, while
-# v_floor = 0 matched dense. The 1e-8 arm continues the screen's setting; the 0 arm
+# Two floor arms, because the floor is itself a change to AdamW even with no truncation
+# (K = N; measured in spec section 45). The 1e-8 arm continues the screen's setting; the 0 arm
 # isolates compression from the floor. At low K a zero floor collapses the denominator
 # (spec section 15), so the 0 arm starts at 50%.
 #

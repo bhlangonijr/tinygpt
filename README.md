@@ -182,10 +182,12 @@ AdamW  M_t = β₁·M_{t-1} + (1-β₁)·T(g_t)
 ```
 
 so with **every** coefficient kept, these optimizers are algebraically identical
-to `torch.optim.SGD` / `torch.optim.AdamW` — `spectral_selftest.py` asserts it to
-floating-point tolerance. Truncation to `K` coefficients is then the *only*
-difference between a compressed run and its dense control, which is what makes a
-loss delta mean something.
+to `torch.optim.SGD` / `torch.optim.AdamW` — `spectral_selftest.py` asserts it in
+fp64. Truncation to `K` coefficients is then the only *algorithmic* difference
+between a compressed run and its dense control, which is what makes a loss delta
+mean something. (In fp32 even `K = N` is not bit-exact AdamW: coefficient rounding
+is set by a tensor's largest values, and AdamW divides each element by its own
+`sqrt(v)`. Measured in the spec, section 45.5.)
 
 ```bash
 # 1. correctness gate: transforms, controller, and K=N equivalence with torch's optimizers
@@ -199,32 +201,31 @@ python train_spectral.py --opt adamw --state dense --scale micro --name adamw_de
 python train_spectral.py --opt adamw --state dct --select topk --kmax-frac 0.05 \
     --mode instrumented --scale micro --name adamw_dct_topk05
 
-# 4. the whole screening matrix, then the tables
-python train_spectral.py --sweep experiments/mvp_screen.jsonl
-python spectral_report.py runs/ --plots
+# 4. a whole sweep, then its tables. One output folder per sweep: every delta is
+#    against that sweep's own dense control, and the report refuses a folder that
+#    mixes commits or GPUs (each summary.json records both).
+python train_spectral.py --sweep experiments/mvp_screen.jsonl --out runs/mvp_screen
+python spectral_report.py runs/mvp_screen --plots
 ```
 
-**Result: no-go.** The screen ran end to end at micro scale. Optimizer state is
-*not* usefully compressible in a fixed orthonormal basis. The first moment needs
-more DCT coefficients than raw coordinates (0.73N vs 0.70N at tau=0.99), and
-shuffling a tensor's entries barely changes that — the DCT finds no spatial
-structure to exploit. The second moment *is* energy-concentrated (86% of its
-energy in 1% of coefficients), but AdamW divides by `sqrt(v)`, so the update
+**Result: no-go** (micro scale, one seed, all numbers from one commit on one GPU).
+Optimizer state is *not* usefully compressible in a fixed orthonormal basis. The
+first moment needs more DCT coefficients than raw coordinates (0.73N vs 0.70N at
+tau=0.99), and shuffling a tensor's entries barely changes that — the DCT finds no
+spatial structure to exploit. The second moment *is* energy-concentrated (86% of
+its energy in 1% of coefficients), but AdamW divides by `sqrt(v)`, so the update
 depends on `v`'s small values, exactly where an energy-optimal truncation errs.
 The one variant that trains within 1% of dense AdamW — spectral `v`, dense `m` —
-saves at most 1.77x of optimizer state (less as K grows, since `m` stays dense)
-for ~40% of throughput, and its quality is flat in K (1%, 5% and 10% of
-coefficients are indistinguishable), so the spectral representation is not what
-makes it work. Adafactor's factored second moment does
-the same job with 3x less storage, no transform cost and no positivity problem.
-Compressing both moments, the convergence curve finds the first point within 5%
-of dense at DCT-Low K/N = 75% (+2.85% val loss), which saves only 14% of optimizer
-state, costs 28% of throughput and raises peak GPU memory; within 1% there is no
-point that saves memory at all. Full numbers, mechanism and the surprises (DCT-Low
-beats DCT-TopK for training even though TopK reconstructs better; fp32 spectral
-state is not exactly AdamW even at K = N) are in
+lands +0.25% to +0.44% with no trend in K, saves at most 1.77x of optimizer state
+(less as K grows, since `m` stays dense) and costs 24-27% of throughput.
+Compressing both moments, the first point within 5% of dense is DCT-Low K/N = 75%
+(+2.84% val loss): 14% less optimizer state, 32% less throughput, and slightly
+*higher* peak GPU memory; within 1% no point saves memory at all. Full numbers,
+the defects found and fixed on the way, and the surprises (DCT-Low beats DCT-TopK
+for training even though TopK reconstructs better; fp32 spectral state is not
+exactly AdamW even at K = N) are in
 [`.specs/spectral-optimizer-state.md`](.specs/spectral-optimizer-state.md),
-sections 42-44.
+sections 44-45.
 
 **Start with the probe.** It trains with an ordinary dense AdamW and only
 *measures*, comparing four bases — best-K DCT, low-frequency DCT, the state's own

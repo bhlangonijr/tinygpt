@@ -26,7 +26,7 @@ path -- the mode must not change the trajectory, or instrumented runs would tell
 us nothing about the runs we actually benchmark:
 
 Either moment can be spectral independently (`m_only`, `v_only`), which matters
-because they are not equally compressible -- see section 42 of the spec for the
+because they are not equally compressible -- see section 45.1 of the spec for the
 measured asymmetry.
 
 * `perf` -- nothing dense is kept for measurement. The capacity controller runs
@@ -65,7 +65,7 @@ class SpectralConfig:
     shrink_patience: int = 3        # H consecutive low refreshes before shrinking
     dynamic: bool = True            # False -> K pinned at K_max (fixed-K control)
     m_only: bool = False            # AdamW: spectral m, dense v (spec step 7)
-    v_only: bool = False            # AdamW: spectral v, dense m (the mirror; see section 42)
+    v_only: bool = False            # AdamW: spectral v, dense m (the mirror; see section 45.1)
     seed_new_from_grad: bool = True  # newly activated coefficients keep this step's gradient
     v_floor: float = 0.0            # floor for the reconstructed second moment; see note below
     mode: str = 'perf'              # 'perf' | 'instrumented'

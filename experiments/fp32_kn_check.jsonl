@@ -1,0 +1,9 @@
+# fp32 K = N check (spec section 44): with every coefficient kept, how far do the weights of
+# spectral AdamW drift from dense AdamW on real gradients, and what does the floor add?
+# Run with:  python train_spectral.py --sweep experiments/fp32_kn_check.jsonl --out <dir>
+# then compare last.pt weights against the dense run (command in spec section 45).
+# 300 steps, checkpoints kept; the dense run is listed twice to show it is bit-reproducible.
+{"name": "kn_dense", "opt": "adamw", "state": "dense", "scale": "micro", "steps": 300, "eval_interval": 300}
+{"name": "kn_dense_repeat", "opt": "adamw", "state": "dense", "scale": "micro", "steps": 300, "eval_interval": 300}
+{"name": "kn_topk100_f0", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 1.0, "fixed_k": true, "v_floor": 0.0, "scale": "micro", "steps": 300, "eval_interval": 300}
+{"name": "kn_topk100_f8", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 1.0, "fixed_k": true, "v_floor": 1e-08, "scale": "micro", "steps": 300, "eval_interval": 300}

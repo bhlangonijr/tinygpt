@@ -415,7 +415,7 @@ def test_reselect():
 
 
 def test_controller_proxy():
-    """Regression for the under-provisioning bug (spec section 43, correction).
+    """Regression for the under-provisioning bug (spec section 44, defect 0).
 
     Under a persistent gradient an EMA converges to the gradient itself, so the
     true state's `K_required` is that of `T(g)` (for `m`) and `T(g^2)` (for `v`).
@@ -545,7 +545,7 @@ def test_training_precision():
     # at floor 0). No transform precision fixes it -- only fp64 coefficients (2x
     # the memory) or a floor (a different update rule). Dense fp32 rounds each
     # element relative to ITSELF, which is the baseline printed first. The effect
-    # on real micro-model training is measured in spec section 43.
+    # on real micro-model training is measured in spec section 45.5.
     for spread, label in ((0.5, 'moderate'), (1.0, 'heavy-tailed')):
         grads = grad_stream(100, spread)
         ref64 = run(torch_adamw, grads, torch.float64)

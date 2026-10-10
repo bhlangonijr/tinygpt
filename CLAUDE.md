@@ -62,8 +62,8 @@ python bench.py --judge                 # + LLM-judge grades (needs ANTHROPIC_AP
 python spectral_selftest.py             # correctness gate -- run this FIRST
 python spectral_probe.py --scale micro  # is optimizer state compressible at all? (go/no-go)
 python train_spectral.py --opt adamw --state dense --scale micro --name adamw_dense
-python train_spectral.py --sweep experiments/mvp_screen.jsonl
-python spectral_report.py runs/ --plots
+python train_spectral.py --sweep experiments/mvp_screen.jsonl --out runs/mvp_screen
+python spectral_report.py runs/mvp_screen --plots
 ```
 
 There is no local torch-free validation path; changes to model/training logic are
@@ -107,6 +107,11 @@ verified by actually running a short training job (lower `max_steps` in
   behind the `Transform` interface in `spectral/transforms.py`. Cross-transform
   comparisons must be in **bytes**, not coefficient counts — a complex STFT
   coefficient costs two fp32s.
+- **Results in the spec come from one commit on one GPU.** Every `summary.json`
+  records the commit, dirty flag and GPU; `spectral_report.py` refuses a folder
+  that mixes them. Run each sweep into its own `--out` folder (deltas are against
+  that folder's dense control), and when code changes in a way that affects
+  results, re-run rather than mixing old and new numbers.
 - Spectral knobs live in `SpectralConfig` (`spectral/optim.py`) and are surfaced
   as `train_spectral.py` flags — the same "experiment knobs stay with the
   experiment" rule as `train_sa.py`.

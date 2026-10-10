@@ -1,11 +1,8 @@
-# Re-run of the v-only arm after the controller fix (02bf076).
-# Run with:  python train_spectral.py --sweep experiments/vonly_rerun.jsonl
-#
-# The screen's v-only runs (mvp_screen.jsonl) used K/N = 0.56 / 0.56 / 0.68% regardless of
-# their 1 / 5 / 10% labels, because the controller under-provisioned -- so they never tested
-# K. Two arms here: the dynamic controller as fixed, and --fixed-k, which pins K exactly at
-# the stated fraction so the x-axis means what it says. A same-session dense control keeps
-# the throughput comparison on one GPU.
+# The v-only arm (spectral v, dense m) at K/N = 1 / 5 / 10%, under the dynamic controller
+# and under --fixed-k (K pinned exactly), with its own dense control. Written to check the
+# capacity-controller fix (spec section 44, defect 0): dynamic and fixed K must now agree.
+# Run with:  python train_spectral.py --sweep experiments/vonly_rerun.jsonl --out runs/vonly_rerun
+# Results: spec section 45.3.
 {"name": "rerun_adamw_dense", "opt": "adamw", "state": "dense", "scale": "micro", "steps": 3000, "no_ckpt": true}
 {"name": "rerun_vonly_k001", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.01, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}
 {"name": "rerun_vonly_k005", "opt": "adamw", "state": "dct", "select": "topk", "kmax_frac": 0.05, "v_only": true, "v_floor": 1e-08, "scale": "micro", "steps": 3000, "no_ckpt": true}

@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Status** | Complete at micro scale (section 37 steps 1–9, DCT only). **Outcome: no-go — see sections 43–44.** |
+| **Status** | Complete at micro scale (section 37 steps 1–9, DCT only). **Outcome: no-go — see section 45.** |
 | **Implementation** | `spectral/`, `train_spectral.py`, `spectral_probe.py`, `spectral_selftest.py`, `spectral_report.py` |
 | **Reconciliation** | Sections 40–42 map this document to the code and record every deviation |
 | **Testbed** | tinyGPT (this repo): one shared model, TinyStories, bits/char on a held-out file |
@@ -458,20 +458,20 @@ poor even when its global reconstruction error looks acceptable.
 
 **Numerical warning — now measured, not hypothesized.** Clamping at exactly zero
 collapses the AdamW denominator to `eps`, making the update `|m_hat| / 1e-8`. A
-heavily truncated run does not merely approximate badly; it diverges within a few
-steps. `spectral_selftest.py` asserts this directly: at `K/N = 0.01`, parameters
-reach `>1e3` times their dense magnitude, and the resulting trajectory error is
-not even monotone in `K`, because it is measuring blow-up rather than
-approximation.
+truncated run does not merely approximate badly; it fails to train. Measured in
+section 45: at floor 0, m+v DCT-Low ends +138% to +143% above dense at
+`K/N` = 50–90%, and about 5% of `v`'s elements reconstruct below zero at every
+budget (45.1), so no `K` short of `N` avoids it.
 
 Consequences for the experiment:
 
 * Truncation quality for AdamW must be assessed on **state reconstruction error
   and update fidelity** (sections 19–20), not on how far a trajectory drifted.
 * A run that uses a positive floor has changed the update rule and must be
-  reported as such. The screening matrix uses `v_floor = 1e-8` (roughly two
-  orders of magnitude below a typical `v` at this scale) and keeps one
+  reported as such. The screening matrix uses `v_floor = 1e-8` and keeps one
   spec-literal `v_floor = 0` run as the control that demonstrates the collapse.
+  The floor's own cost, measured with no truncation at all (`K = N`), is +0.19%
+  validation loss (section 45.4).
 
 ---
 
@@ -1027,17 +1027,17 @@ specification that no longer matches its implementation is worse than none.
 | 37 steps 1–3 — correctness | [spectral_selftest.py](../spectral_selftest.py) |
 
 **Status.** Steps 1–9 implemented, DCT only. Steps 10–11 (STFT) and 12
-(performance optimization) are not started. Measured results are in sections 42
-and 43.
+(performance optimization) are not started. Measured results are in section 45;
+the defects fixed along the way are in section 44.
 
 Run order:
 
 ```bash
 python spectral_selftest.py                                  # gate: K=N equivalence
 python spectral_probe.py --scale micro --steps 3000          # gate: is state compressible?
-python train_spectral.py --sweep experiments/mvp_screen.jsonl
-python spectral_report.py runs/ --plots
-python bench.py runs/<winner>/best.pt                        # repo's own quality gate
+python train_spectral.py --sweep experiments/mvp_screen.jsonl --out runs/mvp_screen
+python spectral_report.py runs/mvp_screen --plots            # one folder = one sweep
+python bench.py runs/mvp_screen/<winner>/best.pt             # repo's own quality gate
 ```
 
 ## 41. Deviations from this specification
@@ -1086,45 +1086,130 @@ Each was a deliberate choice; each is reversible by a flag.
 
 ## 42. Verification status
 
+Every figure in this table is from `spectral_selftest.py` at commit `b201750` on
+an RTX 3060 Ti (`runs/b201750/selftest.log`, 72 checks, all passing).
+
 | Claim | Status |
 |---|---|
-| DCT matches an explicit orthonormal DCT matrix; round-trip exact; Parseval holds; retained energy predicts L2 truncation error | **Passing** on GPU host (`3.19e-15` vs the matrix reference) |
+| DCT matches an explicit orthonormal DCT matrix; round-trip exact; Parseval holds; retained energy predicts L2 truncation error | **Passing** (`3.17e-15` vs the matrix reference, fp64) |
 | `K = N` spectral SGD ≡ `torch.optim.SGD` | **Passing** (`6.21e-16`) |
-| `K = N` spectral AdamW ≡ `torch.optim.AdamW`, incl. m-only and the dense fallback | **Passing** (`3.64e-13`) |
-| K controller: grows now, holds in-band, shrinks after `H`, clamps, damps oscillation | **Passing** |
-| Truncation monotonicity, DCT-Low prefix invariant, section-15 divergence | **Passing** after the test corrections recorded below |
-| Section 37 step 4 probe, micro scale | **Executed** — results below |
-| Training loop, telemetry, memory accounting, report generator | **Executed** — section 43 |
-| fp32 transform accuracy at training shapes; fp64 `K = N` exactness at training shapes for m+v / m-only / v-only / Low | **Passing** (section 44) |
-| Truncated path equals an independent truncated-AdamW reference (DCT-Low, fixed K) | **Passing** (`1.9e-15`) |
-| Re-selection carry-over, seeding and eviction counts; controller covers the steady-state requirement | **Passing** |
-| Reported persistent state equals the bytes actually held | **Passing** after the section 44 fix |
-| fp32 `K = N` exact AdamW | **Does not hold** — a precision limit, measured in section 44 |
+| `K = N` spectral AdamW ≡ `torch.optim.AdamW`: m+v, m-only, v-only, DCT-Low, dense fallback | **Passing** (`3.02e-13`, fp64) |
+| Same, at the training shapes, gradients bounded away from zero | **Passing** (worst element `7.49e-14` of its movement, fp64) |
+| Truncated path equals an independent truncated-AdamW reference (DCT-Low, fixed K=10%) | **Passing** (`1.88e-15`) |
+| Re-selection carry-over, seeding and eviction counts; DCT-Low prefix invariant | **Passing** |
+| K controller: grows now, holds in-band, shrinks after `H`, clamps; covers the steady-state requirement | **Passing** |
+| fp32 DCT at the training shapes vs fp64 matrix DCT; round trip; Parseval | **Passing** (`3.51e-7`, `6.14e-7`, `3.36e-7`) |
+| Reported persistent state equals the bytes actually held | **Passing**, to the byte |
+| fp32 `K = N` is exact AdamW | **Does not hold** — a precision limit (section 44), measured in section 45.5 |
 
-The equivalence row is the one that matters: it establishes that in a compressed
-run, truncation is the *only* difference from dense training. It passes, so
-downstream quality numbers measure compression rather than a bug.
+The equivalence rows are the ones that matter: in a compressed run, truncation is
+the *only* algorithmic difference from dense training.
 
 ### Corrections made after the first selftest execution
 
 1. **Measurement precision bug.** `spectral/metrics.py` downcast every input to
    fp32, silently capping the fp64 checks at ~1e-7 and making an exact identity
    (retained energy predicts L2 truncation error) appear to fail. Real runs use
-   fp32 state, so this never affected training — but it would have degraded every
-   reported metric's precision. Fixed: only sub-fp32 dtypes are promoted.
+   fp32 state, so this never affected training. Fixed: only sub-fp32 dtypes are
+   promoted.
 2. **Churn conflated growth with instability** (see section 41, item 2).
 3. **Two tests asserted things the design never claimed**: monotone trajectory
    convergence for AdamW under a rule that diverges (section 15), and zero churn
-   for DCT-Low under a *dynamic* `K` — growing `K` necessarily changes the active
-   set. Replaced with the invariants that do hold: the DCT-Low active set is
-   always a prefix of the fixed order and evicts nothing while growing; at fixed
-   `K` it never churns at all, while TopK does.
+   for DCT-Low under a *dynamic* `K`. Replaced with the invariants that do hold:
+   the DCT-Low active set is always a prefix of the fixed order and evicts
+   nothing while growing; at fixed `K` it never churns at all, while TopK does.
 
 ### Results to date
 
-**Section 37 step 4 (the go/no-go probe), micro scale, 3,000 steps, one seed.**
-`K_required/N` at `tau = 0.99`, meaned over 16 eligible tensors and 12 probe
-points:
+Moved to section 45. The text that stood here was measured on code with the
+defects listed in section 44; it is preserved in git history (commit `4ffa397`).
+
+---
+
+## 43. Outcome (superseded)
+
+This section held the first screen's results and their later corrections. They
+were measured before the section-44 fixes and on different hardware, so they are
+not comparable with anything current. Every result is re-measured in section 45;
+the original text is preserved in git history (commit `4ffa397`).
+
+---
+
+## 44. Harness audit: defects found and fixed
+
+`spectral_selftest.py` originally ran only in fp64, on tiny CPU tensors, with
+Gaussian gradients, at `K = N`. Extending it — to the truncated path, the
+training shapes and dtype, the memory accounting, and the step cost — and
+auditing the training loop found the defects below. Results measured before a
+fix are not used anywhere in this document.
+
+0. **Capacity controller under-provisioned** (fixed in `02bf076`). The spectrum
+   estimate compared retained EMA coefficients with a one-step `(1-b).T(g)`;
+   for an EMA the steady state is `T(g)` (Adam) or `T(g)/(1-beta)` (SGD
+   momentum), so dynamic `K` settled well below `K_max` while its label said
+   otherwise. Affected: every dynamic-`K` run. Guarded by: the steady-state
+   controller check.
+1. **Memory accounting understated the state held.** The report counted 4 B per
+   TopK index and none for DCT-Low, but the code stored int64 indices for both
+   and cached a full int64 low-frequency order for every eligible shape, even
+   under TopK. Affected: every state-size figure. Fixed: int32 TopK indices; no
+   per-state indices for DCT-Low (its active set is a slice of one shared int32
+   prefix of length `K_max` per shape, counted once as `low_prefix_bytes`); the
+   full order is built only transiently at refresh. Guarded by: reported bytes
+   must equal the bytes of every tensor the optimizer holds.
+2. **The DCT was launch-bound.** Twiddles were rebuilt and both axes transposed
+   on every call, so cost was independent of size and dominated the step.
+   Affected: every throughput figure. Fixed: cached twiddles with the scale
+   folded in, a gather for the even extension, transforms along any axis, `irfft`
+   zero-padding, and one batched call for `g`/`g^2` and for `m`/`v`. Accuracy
+   unchanged (section 42). Guarded by: informational timing in the selftest.
+3. **Evaluation shared the training batch RNG,** so the eval schedule changed
+   the training data order. Affected: absolute loss values (comparisons within
+   one sweep were fair, since all its runs shared the schedule). Fixed:
+   evaluation draws from its own generator, re-seeded at every evaluation, so
+   training is bit-identical under any eval schedule and every run scores the
+   same windows.
+4. **Results carried no provenance.** `summary.json` (and the probe's
+   `probe_meta.json`) now record the git commit, whether the tree was dirty, and
+   the GPU. `spectral_report.py` stamps every table with them and refuses a
+   results folder that mixes them.
+5. **`--sweep --out` wrote elsewhere.** Children ignored `--out`; fixed.
+
+**A precision limit, not a defect: spectral state in fp32 is not exact AdamW,
+even at `K = N`.** Each fp32 coefficient carries ~1e-7 relative rounding, and
+that error lands on every element at the scale of the tensor's *largest* values,
+while AdamW divides each element by its *own* `sqrt(v)`. An element whose `v`
+sits ~7 decades under the tensor maximum (a near-zero gradient) reconstructs at
+or below zero, and its step is then set by the floor, or by `eps` at floor 0.
+Dense fp32 rounds each element relative to itself and does not have this
+problem. In fp64 the code is exact (section 42), so no transform precision fixes
+it — only fp64 coefficients (2x the memory) or a floor (a different update rule).
+Its effect on real training is measured in section 45.5.
+
+---
+
+## 45. Results
+
+**Provenance.** Every number in this section comes from commit `b201750`, a
+clean tree, on one NVIDIA GeForce RTX 3060 Ti, micro scale (`n_layer=4`,
+`n_embd=192`, ~2M parameters, 16 eligible matrices, spectral coverage 88.8%),
+seed 42, single seed. Regenerate any table with
+
+```bash
+python spectral_report.py runs/b201750/<sweep>          # quality/resource tables
+python spectral_probe.py --analyze runs/b201750/probe/probe.csv
+python spectral_report.py runs/b201750/fp32_kn_check --weights-vs kn_dense
+```
+
+Every delta is against the dense control **of the same sweep**. Dense AdamW
+reached val loss 2.2238 in all three training sweeps (bit-identical), while its
+throughput varied 190,216 / 196,712 / 198,010 tok/s; throughput deltas therefore
+carry about ±4% run-to-run noise, and loss deltas none from the control.
+
+### 45.1 Probe: is optimizer state compressible at all? (section 37 step 4)
+
+Dense AdamW, 3,000 steps, probed every 250 steps over 16 tensors.
+`K_required/N` at `tau = 0.99`:
 
 | state | dct_topk | dct_low | identity_topk | dct_shuffled |
 |---|---:|---:|---:|---:|
@@ -1132,443 +1217,195 @@ points:
 | m | 0.729 | 0.989 | 0.695 | 0.735 |
 | v | 0.431 | 0.893 | 0.739 | 0.650 |
 
-This meets two of section 34's failure criteria for the first moment:
-`dct_topk ≈ dct_shuffled` (destroying spatial adjacency costs nothing) and
-`identity_topk < dct_topk` (the state's own coordinates are more compact than its
-DCT). In bytes — the only fair comparison, since TopK stores a 4-byte index per
-4-byte value — AdamW state becomes **9.27 B/param against 8.00 dense (1.16x
-worse)** with TopK, or 7.53 B/param (0.94x) with Low, against a section-35 target
-of 0.50x.
+Residual energy left unrepresented at a fixed budget (`tau`-free):
 
-H1 also fails: `m` (0.729) is no more compressible than raw `g` (0.717), so
-momentum's temporal averaging does not concentrate the spectrum.
-
-**H2 is reversed.** The second moment is the *easier* one under DCT (0.431), and
-it is the only state where the transform beats both controls in both directions
-— evidence of genuine spatial structure, consistent with `g^2` being
-non-negative and carrying a large low-frequency component. Its ceiling is still
-only ~14% state savings, well under the bar.
-
-**Full-CSV analysis** (`spectral_probe.py --analyze`) sharpens all of this.
-
-*Sensitivity to `tau`* — the ranking is stable, but `v`'s magnitude is not:
-
-| state | tau=0.95 | tau=0.99 | tau=0.999 |
-|---|---:|---:|---:|
-| m (dct_topk / identity) | 0.544 / 0.496 | 0.729 / 0.695 | 0.873 / 0.856 |
-| v (dct_topk / identity) | **0.133** / 0.520 | 0.431 / 0.739 | 0.724 / 0.888 |
-
-`m` loses to its own coordinates at every target. `v` beats them at every target,
-by 3.9x at `tau=0.95`.
-
-*Residual energy at a fixed budget* (threshold-free, and the clearest view):
-
-| state | K=1% | K=5% | K=10% | K=25% |
+| state, basis | K=1% | K=5% | K=10% | K=25% |
 |---|---:|---:|---:|---:|
 | m dct_topk | 0.897 | 0.696 | 0.537 | 0.261 |
 | m identity_topk | 0.853 | 0.622 | 0.461 | 0.212 |
-| v dct_topk | **0.140** | 0.095 | 0.069 | 0.031 |
+| v dct_topk | 0.140 | 0.095 | 0.069 | 0.031 |
 | v identity_topk | 0.632 | 0.449 | 0.350 | 0.198 |
 
-**86% of `v`'s energy sits in 1% of its DCT coefficients**, against 37% for its
-own coordinates. That is a large, unambiguous structural signal — and the only
-one in the entire measurement.
+- **`m` is not DCT-compressible.** `dct_topk ≈ dct_shuffled` (0.729 vs 0.735)
+  and `identity_topk < dct_topk` (0.695): two of section 34's failure criteria.
+  H1 fails: `m` (0.729) is no more compressible than raw `g` (0.717).
+- **H2 is reversed.** `v` is the compressible one: 86% of its energy sits in 1%
+  of its DCT coefficients, against 37% in its own coordinates, and it is the only
+  state where the DCT beats both controls.
+- **Q2: capacity does not evolve.** From step 250 on, `K_required/N` stays in
+  0.725–0.730 for `m` and 0.414–0.443 for `v`. By tensor kind, `v` ranges from
+  0.339 (`proj`) to 0.494 (`fc`); `m` is 0.725–0.731 everywhere.
+- In bytes at `tau = 0.99`, both moments compressed cost 9.27 B/param with TopK
+  and 7.53 with Low, against 8.00 dense.
 
-*Q2, answered: capacity does not evolve.* From step 250 onward `K_required/N` is
-flat to three decimals (`m` 0.725→0.730, `v` 0.42–0.44). There are no phases, so
-dynamic `K` has nothing to adapt to and H3 has no mechanism at this scale;
-fixed-`K` is the honest default. Per tensor kind, `v` varies somewhat
-(`proj` 0.339 best, `fc` 0.494 worst) while `m` is flat at ~0.73 everywhere.
+Update fidelity (cosine with the dense AdamW update), DCT-TopK truncation:
 
-*Where this leaves the go/no-go.* Compressing `v` alone and leaving `m` dense:
+| K/N | m truncated, v dense | v truncated, floor 0 | v truncated, floor 1e-8 | v = its mean (1 number), floor 1e-8 | v floored, not truncated |
+|---:|---:|---:|---:|---:|---:|
+| 1% | 0.250 | 0.233 | 0.952 | 0.918 | 0.998 |
+| 5% | 0.447 | 0.209 | 0.947 | 0.918 | 0.998 |
+| 10% | 0.573 | 0.187 | 0.946 | 0.918 | 0.998 |
+| 25% | 0.777 | 0.188 | 0.956 | 0.918 | 0.998 |
 
-| v budget | B/param | vs dense 8.00 | implied L2 error on v |
-|---|---:|---:|---:|
-| K/N = 1% | 4.08 | **0.51x** | 0.374 |
-| K/N = 5% | 4.40 | 0.55x | 0.308 |
-| K/N = 10% | 4.80 | 0.60x | 0.263 |
+Truncating `m` costs update direction at every budget. For `v`, the cosine is
+flat in `K` and set by the floor: about 5% of elements reconstruct below zero at
+every budget (0.045–0.051), so at floor 0 those elements step at `m/eps`. With
+the floor, `K` coefficients of `v` (0.946–0.956) beat a single number (0.918) by
+about 0.03 in cosine.
 
-That is exactly the section-35 bar (0.50x), reached by compressing one moment.
-But retained energy cannot decide it: AdamW consumes `1/sqrt(v)`, which amplifies
-precisely the small values a low-order reconstruction gets wrong, and any element
-driven below zero must be clamped first (section 15). The deciding measurement is
-therefore update fidelity (section 20), which `spectral_probe.py` now computes
-directly from the dense state at each budget, reporting `m_only` / `v_only` /
-`both` separately alongside the negative-`v` and clamp fractions.
+### 45.2 The screen (`experiments/mvp_screen.jsonl`, 30 runs)
 
-**Update fidelity (section 20), first measurement.** Truncating only `m` and
-leaving `v` dense is a clean measurement — no clamp is involved — and it is
-decisive:
+Dense controls: AdamW 2.2238 at 190,216 tok/s; SGD-M 3.5667 at 211,688 tok/s.
+Spectral AdamW runs use `v_floor = 1e-8` unless stated. "State" is persistent
+optimizer state against dense (all parameters, including the 11.2% that always
+keep dense state).
 
-| K/N | update cosine, m truncated |
-|---|---:|
-| 1% | 0.250 |
-| 5% | 0.447 |
-| 10% | 0.573 |
-| 25% | 0.777 |
+| Config | K/N | Val loss vs dense | State | Reduction | Throughput |
+|---|---:|---:|---:|---:|---:|
+| AdamW v-only TopK | 1% | +0.44% | 0.565 | 1.77x | −24.3% |
+| AdamW v-only TopK | 5% | +0.25% | 0.600 | 1.67x | −24.4% |
+| AdamW v-only TopK | 10% | +0.37% | 0.645 | 1.55x | −24.2% |
+| AdamW m-only Low | 5% | +28.39% | 0.584 | 1.71x | −21.9% |
+| AdamW m-only TopK | 5% | +36.48% | 0.600 | 1.67x | −22.8% |
+| AdamW m+v Low | 1% | +41.32% | 0.122 | 8.20x | −28.7% |
+| AdamW m+v Low | 5% | +28.90% | 0.162 | 6.18x | −29.5% |
+| AdamW m+v Low | 25% | +15.30% | 0.362 | 2.76x | −29.3% |
+| AdamW m+v TopK | 1% | +50.10% | 0.130 | 7.71x | −30.4% |
+| AdamW m+v TopK | 2% | +46.23% | 0.147 | 6.78x | −30.5% |
+| AdamW m+v TopK | 5% | +39.63% | 0.201 | 4.98x | −32.7% |
+| AdamW m+v TopK | 10% | +33.00% | 0.290 | 3.45x | −30.6% |
+| AdamW m+v TopK | 25% | +24.75% | 0.556 | 1.80x | −31.8% |
+| AdamW m+v TopK, `v_floor = 0`, 500 steps | 5% | +146.05% | — | — | — |
+| SGD-M Low (dynamic = fixed) | 5% | +2.70% | 0.167 | 5.97x | −24.9% |
+| SGD-M TopK, dynamic | 3.96% (final) | +3.72% | 0.176 | 5.68x | −26.7% |
+| SGD-M TopK, fixed | 5% | +3.63% | 0.201 | 4.98x | −26.4% |
 
-Monotone, as an approximation must be, and poor throughout. Even at a 25% budget
-— which already costs *more* than dense state once indices are counted — the
-compressed optimizer takes a step only 0.78-aligned with the true one. The first
-moment is settled: not usefully compressible in this basis.
+The `v_floor = 0` row ran 500 steps against a 3,000-step control, so its delta
+compares unequal budgets; it is a divergence control, not a quality point.
 
-The `v_only` and `both` columns of that first run are **not** a measurement of
-the approximation, and were discarded. They clamped the reconstruction at exactly
-zero (section 15 as written), and the negative fraction sits at ~5% at *every*
-budget (0.047, 0.050, 0.051, 0.045) because DCT ringing is set by the transform,
-not by `K`. Those elements receive a denominator of `eps` instead of `sqrt(v)`,
-making their step ~1e5 times too large; they then dominate the update norm, and
-the resulting cosine (0.19–0.23) measures the singularity rather than the
-reconstruction — which is why it failed to improve with `K` while `v`'s residual
-energy fell from 0.140 to 0.031.
+Controls on the AdamW m+v TopK 5% configuration:
 
-Two conclusions follow regardless of the re-measurement:
+| Varied | Values | Val loss vs dense | Throughput |
+|---|---|---|---|
+| refresh R | 1 / 10 / 100 / 500 | +41.72% / +39.63% / +32.41% / +32.24% | −59.0% / −32.7% / −25.7% / −25.9% |
+| tau (K_max = 10%) | 0.95 / 0.99 / 0.999 | +33.15% / +33.00% / +32.95% | — |
 
-1. **A floor on the reconstructed second moment is mandatory, not optional**, for
-   any spectral-`v` scheme. The clamped fraction does not shrink appreciably with
-   budget, so there is no `K` at which the problem goes away.
-2. **Update-fidelity metrics must be reported with `update_rel_norm` beside
-   them.** A cosine alone cannot distinguish a poor approximation from a few
-   singular elements; the relative norm makes it obvious at a glance.
+Instrumented twins (shadow dense state; memory and throughput not valid):
 
-The probe now evaluates each budget under three policies — `clamp0` (spec
-literal), an absolute floor, and a floor at a thousandth of the reconstruction's
-own mean (deployable, since for an orthonormal DCT the mean is the DC
-coefficient) — and reports cosine and relative norm for each.
-
-**Second measurement, with floors. The result is flat in `K`:**
-
-| floor | 1% | 5% | 10% | 25% |
-|---|---:|---:|---:|---:|
-| `clamp0` (spec literal) | 0.233 | 0.209 | 0.187 | 0.188 |
-| floor ≈ 1e-9 (`rel1e-3`) | 0.730 | 0.664 | 0.650 | 0.682 |
-| floor = 1e-8 (`abs1e-8`) | 0.952 | 0.947 | 0.946 | 0.956 |
-
-Across that range the reconstruction of `v` improves 4.5x (residual energy
-0.140 → 0.031) and the update cosine does not move. It is monotone in the
-**floor** and flat in **K**. So update fidelity here is not a function of how
-well the second moment is reconstructed at all — it is a function of how the
-small values are handled.
-
-**This is the mechanism behind the whole negative result, and it is not specific
-to the DCT.** Coefficient energy is dominated by `v`'s *large* entries, which any
-L2-optimal truncation reproduces first. But AdamW divides by `sqrt(v)`, so the
-update is governed by `v`'s *small* entries — precisely where a truncated
-reconstruction rings, and precisely where relative error is largest. The
-section-9 retained-energy criterion is therefore the **wrong objective for a
-second moment**: it optimizes accuracy where the optimizer is least sensitive.
-Any future attempt at compressing `v` needs a relative-error or log-domain
-criterion, not an energy one.
-
-Two controls were added to test whether the transform contributes anything at
-the update level at all: `v_scalar` replaces the entire second moment with a
-single number (its mean), and `v_floor_only` applies the floor without
-truncating. `v_scalar` is `K`-independent by construction, so if `v_only` does
-not beat it, the spectral representation is decoration — the same question
-`identity_topk` answered for the energy criterion.
-
-Caveats: micro scale (192-wide matrices), early training, single seed. Scale may
-move the magnitudes; it is unlikely to reverse the within-tensor shuffle and
-identity controls, which compare a tensor against itself.
-
-
----
-
-## 43. Outcome (micro scale, 30-config screen, one seed)
-
-The full screening matrix ran: two dense controls and 28 spectral configurations,
-3,000 steps each on identical data, initialization and schedule.
-
-### Quality and resources
-
-> **Memory caveat (section 44, defect 1).** The state ratios in this section are
-> what the method needs; the code that produced these runs held 1.4–3.4x more
-> (int64 indices, indices stored for DCT-Low, an uncounted full order cache).
-> Fixed since; quality numbers are unaffected. Throughput here also predates the
-> faster DCT of section 44.
-
-| Config | val loss | vs dense | state | reduction | tok/s | throughput |
-|---|---:|---:|---:|---:|---:|---:|
-| **AdamW dense (control)** | 2.2018 | — | 1.000 | 1.0x | 194,542 | — |
-| AdamW v-only, K=1% | 2.2129 | +0.50% | 0.561 | 1.78x | 108,110 | −44.4% |
-| AdamW v-only, K=5% | 2.2108 | +0.41% | 0.561 | 1.78x | 108,296 | −44.3% |
-| AdamW v-only, K=10% | 2.2150 | +0.60% | 0.562 | 1.78x | 109,243 | −43.8% |
-| AdamW m-only, K=5% Low | 2.8367 | +28.8% | 0.578 | 1.73x | 109,999 | −43.5% |
-| AdamW m+v, K=25% Low | 2.5297 | +14.9% | 0.334 | 2.99x | 75,845 | −61.0% |
-| AdamW m+v, K=5% Low | 2.8478 | +29.3% | 0.155 | 6.45x | 76,500 | −60.7% |
-| AdamW m+v, K=1% TopK | 3.1629 | +43.7% | 0.125 | 8.00x | 72,850 | −62.6% |
-| AdamW m+v, K=5%, `v_floor=0` | 5.5629 | +152.7% | 0.163 | 6.13x | 65,851 | −66.2% |
-| **SGD-M dense (control)** | 3.5516 | — | 1.000 | 1.0x | 206,758 | — |
-| SGD-M K=5% Low | 3.6368 | +2.40% | 0.156 | 6.41x | 116,977 | −43.4% |
-| SGD-M K=5% TopK | 3.6698 | +3.33% | 0.172 | 5.81x | 114,796 | −44.5% |
-
-### Verdict against section 35
-
-Only one configuration has acceptable quality — spectral `v`, dense `m`:
-
-```
-quality      <= 1% degradation   ->  +0.37 .. +0.62%   PASS
-memory       >= 2x reduction     ->  1.55 .. 1.77x     MISS
-throughput   <= 10% loss         ->  -39 .. -44%       FAIL
-```
-
-(Ranges span the screen and the post-fix re-run below. Memory is now the re-run's
-correctly provisioned figures: 1.77x at K/N = 1%, falling as K grows; the
-screen's 1.78x reflected K/N ≈ 0.6%.)
-
-**No-go.** The one variant that trains well costs ~40% of throughput to save at
-most 1.77x of optimizer state, which is the section-39 inequality failing outright: the
-memory saved does not cover the compute spent. Some of that 44% is
-implementation (the DCT here uses a 2N even extension rather than a Makhoul-style
-N/2 FFT, worth perhaps 2x), but no plausible constant closes a 4x gap to the 10%
-gate.
-
-### Why the v-only result does not rescue the premise
-
-Quality is **flat in `K`**: with `K` pinned exactly (post-fix re-run below),
-2.2170 / 2.2126 / 2.2145 at 1% / 5% / 10%, non-monotone and within 0.006 nats.
-Ten times more coefficients buys nothing. This is the training-level echo of the fidelity measurement in section 42, and it says the
-spectral representation is not what makes the run work — AdamW is simply
-insensitive to the accuracy of its second moment, as long as the denominator is
-kept away from zero.
-
-That insensitivity is a known property, and it is much better exploited by
-existing methods. Adafactor factorizes `v` into row and column vectors: `m + n`
-values instead of `m . n`, which for these matrices is **0.65% of N stored as
-4-byte values (0.026 B/param), against 0.08 B/param for DCT-TopK at K/N = 1%**.
-It is non-negative by construction, so it needs no floor and has no clamp
-pathology, and it costs no transform. It reaches the 2x bar this method missed,
-with none of the throughput penalty. A spectral second moment is dominated on
-every axis.
-
-### Findings worth keeping
-
-1. **DCT-Low beats DCT-TopK for training, consistently**, despite TopK being the
-   L2-optimal K-term approximation: 2.8478 vs 2.9120 (m+v, K=5%), 2.5297 vs
-   2.5812 (K=25%), 2.8367 vs 2.9211 (m-only), 3.6368 vs 3.6698 (SGD-M). Better
-   reconstruction produces a worse optimizer. The mechanism is section 16:
-   TopK's active set churns, and every eviction destroys accumulated history,
-   while Low's deterministic prefix never evicts. **Active-set stability matters
-   more than reconstruction optimality** — a result that inverts the obvious
-   choice of selection policy.
-2. **Dynamic K did nothing** (H3 fails). With `K_required/N ≈ 0.73` and `K_max`
-   at a few percent, the controller pins at `K_max` permanently: dynamic and
-   fixed-K runs are bit-identical (3.6368 both). `tau` is likewise inert
-   (2.7788 / 2.7823 / 2.7886 for 0.999 / 0.99 / 0.95) for the same reason.
-3. **`R = 1` is the best refresh interval** (2.7946 vs 2.8919 at R=100 and 2.9156
-   at R=500) but costs a further 27% throughput. Re-selecting often helps because
-   it keeps the active set matched to a spectrum that keeps moving — which is
-   itself evidence the representation is a poor fit.
-4. **Section 15 confirmed in training**: the spec-literal `v_floor = 0` run
-   stalls at 5.5629 (+152%), never recovering.
-5. **SGD momentum tolerates compression well** (+2.4% at 6.4x state reduction) —
-   but SGD-M dense is itself 61% worse than AdamW dense (3.5516 vs 2.2018), so a
-   compressible momentum buys nothing anyone wants.
-
-### Correction: the screen never approached K = N, and its K labels overstate K
-
-Two issues surfaced when the sweep's reported state sizes were reconciled against
-`K_max`.
-
-**The capacity controller was under-provisioning.** It compared retained
-coefficients (which hold accumulated EMAs) against a *one-step* gradient
-contribution `(1-b).T(g)`. For an EMA `m <- b.m + (1-b).g` a persistent gradient
-converges to `g` itself, so the out-of-set energy looked 10–20x smaller than it
-is, and `K` settled at roughly half its cap. Backed out of the reported state
-sizes:
-
-| config | `K_max` | K/N actually used |
-|---|---:|---:|
-| AdamW m+v TopK | 5% | 2.6% |
-| AdamW m+v TopK | 10% | 5.2% |
-| AdamW m+v TopK | 25% | 12.6% |
-| AdamW v-only TopK | 1% / 5% / 10% | 0.56% / 0.56% / 0.68% |
-
-Fixed: the spectrum estimate now uses the steady-state magnitude
-(`T(g)` for Adam's moments, `T(g)/(1-beta)` for SGD momentum) while newly
-activated coefficients are still seeded with the true one-step contribution. All
-numbers in this section predate the fix; the verdict is unaffected, since larger
-`K` costs more memory for the modest quality gain the curve already shows.
-
-**A claim of mine was wrong.** I reported the three v-only runs as evidence that
-training quality is flat in `K`. They are not: their actual `K/N` was
-0.56% / 0.56% / 0.68% — nearly identical — so they never tested `K` at all. The
-flat-in-`K` finding then rested solely on the probe's offline sweep (section 42).
-It has since been measured in training; see the re-run below.
-
-**The convergence region was never measured.** The screen capped at 25% and
-reached 12.6%, while `K = N` is the point where the optimizer is algebraically
-AdamW. The `experiments/highk_curve.jsonl` arm fills this in with `--fixed-k` at
-K/N = 25 / 50 / 75 / 100%, where the break-even points are:
-
-```
-DCT-TopK (4B value + 4B index)   costs as much as dense state at K/N = 50%
-DCT-Low  (4B value, no index)    costs as much as dense state at K/N = 100%
-probe: m needs K/N = 73% (TopK) / 99% (Low) to retain 99% of its energy
-```
-
-Loss must return to the dense control at K/N = 1.0 — but by then TopK occupies
-1.89x the memory of the dense state it replaced. If quality only recovers past
-break-even, the method has no operating region at all, which is the structural
-form of this negative result.
-
-### Re-run of the v-only arm after the controller fix
-
-`experiments/vonly_rerun.jsonl`: the v-only arm on the fixed controller, the same
-budgets under `--fixed-k` (K pinned exactly, no controller), and a same-session
-dense control. Micro scale, 3,000 steps, seed 42, all on one GPU. The selftest
-gate passed first.
-
-| Config | K/N used | val loss | vs dense | state | reduction | tok/s |
-|---|---:|---:|---:|---:|---:|---:|
-| **AdamW dense (control)** | — | 2.2033 | — | 1.000 | 1.0x | 135,986 |
-| v-only dynamic, `K_max` = 1% | 1.00% | 2.2151 | +0.54% | 0.565 | 1.77x | 82,102 |
-| v-only dynamic, `K_max` = 5% | 5.00% | 2.2114 | +0.37% | 0.600 | 1.67x | 82,667 |
-| v-only dynamic, `K_max` = 10% | 10.00% | 2.2139 | +0.48% | 0.645 | 1.55x | 82,351 |
-| v-only fixed K = 1% | 1.00% | 2.2170 | +0.62% | 0.565 | 1.77x | 82,810 |
-| v-only fixed K = 5% | 5.00% | 2.2126 | +0.42% | 0.600 | 1.67x | 82,155 |
-| v-only fixed K = 10% | 10.00% | 2.2145 | +0.51% | 0.645 | 1.55x | 82,325 |
-
-1. **The fix works.** The dynamic controller now sits at its cap (cap-hit
-   0.997–0.999), so dynamic and fixed `K` are effectively the same runs — consistent
-   with `K_required/N` being far above any `K_max` tested.
-2. **Memory now moves with `K`, and only downward.** With `m` dense, the eligible
-   state is `(4 + 8·K/N) / 8` of dense, and 11.2% of state is non-eligible
-   (embeddings, head, norms). The ceiling as `K -> 0` is ~1.80x, so **v-only
-   cannot reach the 2x bar at any `K`**.
-3. **Quality is flat in `K`**, now measured in training: the six runs span
-   2.2114–2.2170 with no monotone trend. Single seed, so the spread cannot be
-   separated from seed noise; the two dense controls (screen and re-run) differ
-   by 0.0015 on identical settings.
-4. **TopK churn is very high once `K` is provisioned** — 0.89 / 0.96 / 0.97 at
-   1 / 5 / 10%, against ~0.07 in the under-provisioned screen runs — and quality
-   does not care. That fits AdamW's insensitivity to the second moment's
-   accuracy, given a floor.
-5. **Throughput −39%** against the same-session control. This GPU is slower than
-   the screen's (dense 136k vs 195k tok/s), so the percentage is not strictly
-   comparable with the screen's −44%; both are far outside the 10% gate.
-
-### What would have to be true for this to work
-
-The measurements point at a specific, falsifiable requirement rather than a
-vague "needs more work". Any future attempt needs a representation that is
-(a) accurate in *relative* terms on the small values of `v`, not in L2 energy;
-(b) non-negative by construction, so no floor is needed; and (c) cheap enough to
-apply every step. Adafactor already satisfies all three. A fixed orthonormal
-transform satisfies none of them, and section 42 explains why: energy-optimal
-truncation puts its error exactly where `1/sqrt(v)` is most sensitive.
-
----
-
-## 44. Harness audit and the m+v convergence curve
-
-### Audit: what `spectral_selftest.py` now checks, and what it found
-
-The original gate ran only in fp64 on tiny CPU tensors with Gaussian gradients,
-and only at `K = N`. It was extended to cover the truncated path, the training
-shapes and dtype, the memory accounting and the step cost. It now passes 72
-checks. Four defects were found and fixed; one limit was found and is measured
-rather than gated.
-
-**Defect 1 — memory accounting understated what the code held.** The report
-counted 4 B per TopK index and 0 B for DCT-Low, but the code stored int64
-indices for *both* policies and also cached a full int64 low-frequency order
-(one int per coefficient) for every eligible shape, even under TopK. Measured
-on the micro shapes, m+v Low at `K/N` = 5%: 0.71 MB reported against 5.66 MB
-held. Recomputed from each summary, the screen's runs held 1.4–3.4x the
-reported state; m+v Low at 25% held as much as dense. Fixed: TopK indices are
-int32, DCT-Low holds no per-state indices (its active set is a slice of one
-shared int32 prefix of length `K_max` per shape, counted once in
-`memory_report()` as `low_prefix_bytes`), and the full order is built only
-transiently at refresh. The harness walks every tensor the optimizer holds and
-asserts the report equals it to the byte. Quality results are unaffected —
-accounting never touched the trajectory — and the earlier *reported* ratios are
-what the method needs, which the code now actually holds (plus the Low prefix).
-
-**Defect 2 — the DCT was launch-bound.** Every call rebuilt its twiddles and
-transposed twice; ~424 µs forward and ~545 µs inverse per matrix regardless of
-size. Sampled phase timing put transforms at ~35 ms of a ~56 ms step. Fixed:
-cached twiddles with the scale folded in, a gather for the even extension,
-transforms along any axis (no transposes), implicit zero padding in `irfft`, and
-one batched call for `g` and `g^2` (and for reconstructing `m` and `v`). Now
-~140 / ~180 µs per matrix, same accuracy (fp32 4e-7, fp64 1e-13 against the
-matrix DCT; batched equals separate to fp32 rounding — bit for bit on a GTX
-1080 Ti, 5e-9 on an RTX 3060 Ti). Training throughput cost of
-m+v went from −61% to −28% against a same-sweep dense control.
-
-**Defect 3 — evaluation shared the training batch RNG.** Each evaluation drew
-windows from the same generator as training, so the eval schedule changed the
-training data order (300-step dense runs: 3.6420 at `--eval-interval 100` vs
-3.6433 at 300). Fixed: evaluation has its own generator, re-seeded at every
-evaluation, so training is bit-identical under any eval schedule (verified:
-parameters equal to 0.0) and every run scores the same windows.
-
-**Defect 4 — the GPU was not recorded.** `summary.json` now carries `gpu`.
-
-**Measured limit — spectral state in fp32 is not exact AdamW even at K = N.**
-Each fp32 coefficient carries ~1e-7 relative rounding, which lands on every
-element at the scale of the tensor's *largest* values, while AdamW divides each
-element by its *own* `sqrt(v)`. An element whose `v` sits ~7 decades under the
-tensor maximum (a near-zero gradient, typically early) reconstructs at or below
-zero; its step is then set by the floor, or by `eps` at floor 0 (observed: one
-element stepping 237x `lr`). Dense fp32 rounds each element relative to itself,
-so it does not have this problem. In fp64 the code is exact (worst element
-7e-14 of its movement at the training shapes, gradients bounded away from
-zero), so this is precision, not a bug. On real micro-model gradients, 300 steps,
-against a bit-reproducible dense run:
-
-| K = N, fp32 | val loss | eligible weights off by >0.1% of max\|p\| | worst element |
-|---|---:|---:|---:|
-| dense (second run) | 3.6433 | 0.0% | 0 |
-| spectral, `v_floor = 0` | 3.6432 | 11.4% | 4.6% |
-| spectral, `v_floor = 1e-8` | 3.6593 | 94.6% | 52% |
-
-Weights diverge measurably at floor 0, but loss does not; the floor is the
-larger perturbation.
-
-### The m+v convergence curve (`experiments/highk_curve.jsonl`)
-
-Every spectral run is m+v with `--fixed-k`. One dense control, same sweep, same
-GPU (GTX 1080 Ti), micro scale, 3,000 steps, seed 42, code as fixed above.
-Dense: val 2.2235, 133,643 tok/s, peak 334.6 MB.
-
-| Selection | K/N | v_floor | val loss vs dense | state vs dense | reduction | tok/s vs dense | peak GPU memory |
+| Run | m error | v error | update cos | v clamped | churn | proxy/oracle K | saturation r |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Low | 5% | 1e-8 | +28.90% | 0.162 | 6.18x | −28.2% | 327.6 MB |
-| Low | 10% | 1e-8 | +22.51% | 0.212 | 4.72x | −28.2% | 328.4 MB |
-| Low | 25% | 1e-8 | +14.56% | 0.362 | 2.76x | −28.4% | 330.6 MB |
-| Low | 50% | 1e-8 | +6.76% | 0.611 | 1.64x | −28.0% | 334.4 MB |
-| Low | **75%** | 1e-8 | **+2.85%** | 0.861 | **1.16x** | −28.0% | 338.2 MB |
-| Low | 90% | 1e-8 | +1.01% | 1.011 | 0.99x | −27.9% | 340.5 MB |
-| Low | 100% | 1e-8 | +0.16% | 1.111 | 0.90x | −28.0% | 342.0 MB |
-| Low | 50% | 0 | +132.37% | 0.611 | 1.64x | −26.7% | 334.4 MB |
-| Low | 75% | 0 | +126.84% | 0.861 | 1.16x | −26.9% | 338.2 MB |
-| Low | 90% | 0 | +128.86% | 1.011 | 0.99x | −26.7% | 340.5 MB |
-| Low | 100% | 0 | −0.00% | 1.111 | 0.90x | −28.0% | 342.0 MB |
-| TopK | 25% | 1e-8 | +24.57% | 0.556 | 1.80x | −28.5% | 333.6 MB |
-| TopK | 50% | 1e-8 | +10.95% | 1.000 | 1.00x | −28.8% | 340.3 MB |
-| TopK | 75% | 1e-8 | +3.35% | 1.444 | 0.69x | −28.7% | 347.1 MB |
-| TopK | 100% | 1e-8 | +0.16% | 1.888 | 0.53x | −28.1% | 353.8 MB |
-| TopK | 100% | 0 | −0.00% | 1.888 | 0.53x | −28.1% | 353.8 MB |
+| AdamW m+v Low 5% | 0.902 | 0.414 | 0.420 | 11.1% | 0.000 | 1.00 | −0.12 |
+| AdamW m+v TopK 5% | 0.971 | 0.308 | 0.176 | 11.0% | 1.000 | 0.97 | 0.02 |
+| AdamW v-only TopK 1% | — | 0.386 | — | 8.1% | — | — | 0.13 |
+| SGD-M TopK 5% | 0.613 | — | 0.723 | — | 0.843 | 1.53 | −0.88 |
 
-What it establishes:
+### 45.3 The v-only arm (`experiments/vonly_rerun.jsonl`, 7 runs)
 
-1. **The pipeline is correct end to end.** At `K = N` with floor 0, both
-   selections reproduce dense val loss (2.2234 vs 2.2235).
-2. **The floor costs +0.16% by itself** (`K = N`, floor 1e-8). It is the floor
-   that changes the rule, not the transform.
-3. **Below `K = N`, a zero floor collapses** (+127–132% at 50–90%): any
-   truncation produces non-positive `v` somewhere, and those elements step at
-   `m/eps`. The floor is mandatory for any compressed `v`.
-4. **Quality is monotone in K for both selections**, and DCT-Low beats TopK at
-   every K tested, consistent with section 43 finding 1.
-5. **Compression point at a 5% bar: DCT-Low K/N = 75%**, +2.85% val
-   loss, 1.16x state reduction (14% less optimizer state), −28.0% throughput,
-   and *higher* peak GPU memory than dense (338.2 vs 334.6 MB: the reconstruction
-   scratch and transform temporaries outweigh the 14% state saving at this
-   scale). The next point down, 50%, misses at +6.76%.
-6. **At the section-35 bar (≤1%) there is no compression point.** The closest,
-   Low K/N = 90%, is +1.01% at 0.99x — no saving. TopK needs K/N > 50% to get
-   under 10% degradation, which already costs more than dense state.
+Dense control 2.2238 at 196,712 tok/s.
 
-Single seed; untested whether a K between 50% and 75% also meets 5%.
+| Config | K/N | Val loss vs dense | State | Reduction | Throughput |
+|---|---:|---:|---:|---:|---:|
+| v-only TopK, fixed K | 1% | +0.38% | 0.565 | 1.77x | −26.3% |
+| v-only TopK, fixed K | 5% | +0.29% | 0.600 | 1.67x | −26.0% |
+| v-only TopK, fixed K | 10% | +0.27% | 0.645 | 1.55x | −26.4% |
+| v-only TopK, dynamic | 1% | +0.44% | 0.565 | 1.77x | −26.9% |
+| v-only TopK, dynamic | 5% | +0.25% | 0.600 | 1.67x | −26.0% |
+| v-only TopK, dynamic | 10% | +0.37% | 0.645 | 1.55x | −25.9% |
+
+All six are within 0.27–0.44% of dense, with no monotone trend in `K`. The
+floor alone costs +0.19% at `K = N` (section 45.4), so most of this gap is
+attributable to the floor rather than to truncation. Memory reduction falls as
+`K` grows; with `m` dense the ceiling as `K -> 0` is about 1.80x.
+
+### 45.4 The m+v convergence curve (`experiments/highk_curve.jsonl`, 17 runs)
+
+Fixed `K`, both moments spectral. Dense control 2.2238 at 198,010 tok/s, peak
+244 MiB.
+
+| Selection | K/N | v_floor | Val loss vs dense | State | Reduction | Throughput | Peak MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Low | 5% | 1e-8 | +28.90% | 0.162 | 6.18x | −31.8% | 236 |
+| Low | 10% | 1e-8 | +22.55% | 0.212 | 4.72x | −31.5% | 236 |
+| Low | 25% | 1e-8 | +15.30% | 0.362 | 2.76x | −32.1% | 239 |
+| Low | 50% | 1e-8 | +6.68% | 0.611 | 1.64x | −31.7% | 242 |
+| Low | **75%** | 1e-8 | **+2.84%** | 0.861 | **1.16x** | −31.9% | 246 |
+| Low | 90% | 1e-8 | +1.13% | 1.011 | 0.99x | −31.6% | 249 |
+| Low | 100% | 1e-8 | +0.19% | 1.111 | 0.90x | −31.9% | 250 |
+| Low | 50% / 75% / 90% | 0 | +143.40% / +140.55% / +138.02% | — | — | — | — |
+| Low | 100% | 0 | −0.00% | 1.111 | 0.90x | −32.1% | 250 |
+| TopK | 25% | 1e-8 | +24.59% | 0.556 | 1.80x | −34.0% | 242 |
+| TopK | 50% | 1e-8 | +11.23% | 1.000 | 1.00x | −33.9% | 248 |
+| TopK | 75% | 1e-8 | +3.43% | 1.444 | 0.69x | −33.8% | 255 |
+| TopK | 100% | 1e-8 | +0.19% | 1.888 | 0.53x | −32.6% | 262 |
+| TopK | 100% | 0 | −0.00% | 1.888 | 0.53x | −32.4% | 262 |
+
+- At `K = N` with floor 0 both selections reproduce dense loss (2.2237 vs
+  2.2238): the pipeline is correct end to end.
+- The floor alone costs +0.19% (`K = N`, floor 1e-8).
+- Below `K = N`, floor 0 collapses (+138% to +143%).
+- **First point within 5% of dense: DCT-Low K/N = 75%** (+2.84%), at 1.16x state
+  reduction, −31.9% throughput, and peak GPU memory 2 MiB *above* dense. The
+  next point down, 50%, is +6.68%. Points between 50% and 75% were not run.
+- **Within 1% of dense, no point saves memory**: Low 90% is +1.13% at 0.99x.
+
+### 45.5 fp32 at K = N on real gradients (`experiments/fp32_kn_check.jsonl`)
+
+300 steps, weights compared element by element against the dense run:
+
+| Run | Val loss | Eligible weights off by >0.1% of max\|p\| | Worst element |
+|---|---:|---:|---:|
+| dense, repeated | 3.6473 | 0 (0.0%) | 0 |
+| spectral TopK K = N, floor 0 | 3.6472 | 264,794 (15.0%) | 7.2% |
+| spectral TopK K = N, floor 1e-8 | 3.6643 | 1,671,523 (94.5%) | 51.7% |
+
+Dense is bit-reproducible, so these differences are real. At floor 0 the
+weights diverge measurably and the loss does not; the floor is the larger
+perturbation.
+
+### 45.6 Verdict against section 35
+
+| Configuration | Quality ≤ 1% | State reduction ≥ 2x | Throughput loss ≤ 10% |
+|---|---|---|---|
+| AdamW v-only, K/N 1–10% | **pass** (+0.25% to +0.44%) | miss (1.55–1.77x) | fail (−24% to −27%) |
+| AdamW m+v, best within 1% | none saves memory | — | — |
+| AdamW m+v, Low K/N = 75% | miss (+2.84%) | miss (1.16x) | fail (−31.9%) |
+| SGD-M Low K/N = 5% | fail (+2.70%) | pass (5.97x) | fail (−24.9%) |
+
+**No-go.** No configuration meets all three bars, and none meets two of them.
+
+### 45.7 Findings
+
+1. **DCT-Low beats DCT-TopK at every matched configuration**, though TopK is
+   the L2-optimal K-term approximation: m+v 5% 2.8666 vs 3.1050; m+v 25% 2.5641
+   vs 2.7741; m-only 2.8552 vs 3.0351; SGD-M fixed 3.6629 vs 3.6963; curve at
+   25/50/75% 2.5641/2.3723/2.2870 vs 2.7706/2.4734/2.3000. TopK's active set
+   turns over completely at every refresh at R = 10 (churn 1.000), Low's never
+   (0.000).
+2. **Re-selecting less often is better for TopK**: R = 500 +32.24% against
+   R = 1 +41.72%. This is consistent with eviction destroying accumulated
+   history (section 16).
+3. **Dynamic K does nothing for AdamW.** Every dynamic AdamW run ends at
+   `K_max` with a 100% cap-hit rate, and dynamic Low 5% equals fixed Low 5%
+   exactly (2.8666 in both). For SGD-M TopK the controller holds 3.96% of a 5%
+   cap and lands within 0.1% of fixed K. `tau` is inert (+32.95% to +33.15%). H3
+   fails at this scale.
+4. **The deployable proxy tracks the oracle K** for AdamW (proxy/oracle 1.00 Low,
+   0.97 TopK) and over-estimates it for SGD-M TopK (1.53).
+5. **Saturation predicts fidelity loss only for SGD-M** (r = −0.88); for AdamW
+   it does not (−0.12, 0.02, 0.13). H4 holds for momentum, not for Adam.
+6. **A floor is mandatory below K = N** and costs +0.19% by itself at K = N.
+7. **SGD-M tolerates compression** (+2.70% at 5.97x), but SGD-M dense is 60.4%
+   worse than AdamW dense (3.5667 vs 2.2238).
+
+### 45.8 What would have to be true for this to work
+
+The measurements point at a specific requirement. A representation of `v` would
+need to be (a) accurate in *relative* terms on its small values, since AdamW
+divides by them, rather than in L2 energy, which section 45.1 shows a fixed
+orthonormal truncation optimizes; (b) non-negative by construction, so no floor
+is needed (45.4); and (c) cheap enough to apply every step (45.2–45.4: −22% to
+−34%). A factored second moment (Adafactor: one value per row and per column,
+`m + n` instead of `m.n`) satisfies (b) by construction and stores 0.69% of `N`
+for these matrices — arithmetic on storage only. Its quality and speed were
+**not** measured in this experiment; comparing against it is the obvious next
+run.
