@@ -212,9 +212,10 @@ structure to exploit. The second moment *is* energy-concentrated (86% of its
 energy in 1% of coefficients), but AdamW divides by `sqrt(v)`, so the update
 depends on `v`'s small values, exactly where an energy-optimal truncation errs.
 The one variant that trains within 1% of dense AdamW — spectral `v`, dense `m` —
-saves 1.78x of optimizer state for 44% of throughput, and its quality is flat in
-K (1%, 5% and 10% of coefficients are indistinguishable), so the spectral
-representation is not what makes it work. Adafactor's factored second moment does
+saves at most 1.77x of optimizer state (less as K grows, since `m` stays dense)
+for ~40% of throughput, and its quality is flat in K (1%, 5% and 10% of
+coefficients are indistinguishable), so the spectral representation is not what
+makes it work. Adafactor's factored second moment does
 the same job with 3x less storage, no transform cost and no positivity problem.
 Full numbers, mechanism and the surprises (DCT-Low beats DCT-TopK for training
 even though TopK reconstructs better) are in

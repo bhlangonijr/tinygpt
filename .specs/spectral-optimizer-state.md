@@ -1027,8 +1027,8 @@ specification that no longer matches its implementation is worse than none.
 | 37 steps 1–3 — correctness | [spectral_selftest.py](../spectral_selftest.py) |
 
 **Status.** Steps 1–9 implemented, DCT only. Steps 10–11 (STFT) and 12
-(performance optimization) are not started. **Nothing has been run yet** — no
-number in any table of this document has been measured.
+(performance optimization) are not started. Measured results are in sections 42
+and 43.
 
 Run order:
 
@@ -1094,7 +1094,7 @@ Each was a deliberate choice; each is reversible by a flag.
 | K controller: grows now, holds in-band, shrinks after `H`, clamps, damps oscillation | **Passing** |
 | Truncation monotonicity, DCT-Low prefix invariant, section-15 divergence | **Passing** after the test corrections recorded below |
 | Section 37 step 4 probe, micro scale | **Executed** — results below |
-| Training loop, telemetry, memory accounting, report generator | **Not yet executed** |
+| Training loop, telemetry, memory accounting, report generator | **Executed** — section 43 |
 
 The equivalence row is the one that matters: it establishes that in a compressed
 run, truncation is the *only* difference from dense training. It passes, so
@@ -1296,13 +1296,17 @@ The full screening matrix ran: two dense controls and 28 spectral configurations
 Only one configuration has acceptable quality — spectral `v`, dense `m`:
 
 ```
-quality      <= 1% degradation   ->  +0.41 .. +0.60%   PASS
-memory       >= 2x reduction     ->  1.78x             MISS
-throughput   <= 10% loss         ->  -44%              FAIL
+quality      <= 1% degradation   ->  +0.37 .. +0.62%   PASS
+memory       >= 2x reduction     ->  1.55 .. 1.77x     MISS
+throughput   <= 10% loss         ->  -39 .. -44%       FAIL
 ```
 
-**No-go.** The one variant that trains well costs 44% of throughput to save 1.78x
-of optimizer state, which is the section-39 inequality failing outright: the
+(Ranges span the screen and the post-fix re-run below. Memory is now the re-run's
+correctly provisioned figures: 1.77x at K/N = 1%, falling as K grows; the
+screen's 1.78x reflected K/N ≈ 0.6%.)
+
+**No-go.** The one variant that trains well costs ~40% of throughput to save at
+most 1.77x of optimizer state, which is the section-39 inequality failing outright: the
 memory saved does not cover the compute spent. Some of that 44% is
 implementation (the DCT here uses a 2N even extension rather than a Makhoul-style
 N/2 FFT, worth perhaps 2x), but no plausible constant closes a 4x gap to the 10%
@@ -1310,9 +1314,9 @@ gate.
 
 ### Why the v-only result does not rescue the premise
 
-Quality is **flat in `K`**: 2.2129 / 2.2108 / 2.2150 at 1% / 5% / 10%, a spread
-smaller than seed noise. Ten times more coefficients buys nothing. This is the
-training-level echo of the fidelity measurement in section 42, and it says the
+Quality is **flat in `K`**: with `K` pinned exactly (post-fix re-run below),
+2.2170 / 2.2126 / 2.2145 at 1% / 5% / 10%, non-monotone and within 0.006 nats.
+Ten times more coefficients buys nothing. This is the training-level echo of the fidelity measurement in section 42, and it says the
 spectral representation is not what makes the run work — AdamW is simply
 insensitive to the accuracy of its second moment, as long as the denominator is
 kept away from zero.
@@ -1378,8 +1382,8 @@ numbers in this section predate the fix; the verdict is unaffected, since larger
 **A claim of mine was wrong.** I reported the three v-only runs as evidence that
 training quality is flat in `K`. They are not: their actual `K/N` was
 0.56% / 0.56% / 0.68% — nearly identical — so they never tested `K` at all. The
-flat-in-`K` finding rests solely on the probe's offline sweep (section 42), which
-truncates at exact budgets with no controller involved and is unaffected.
+flat-in-`K` finding then rested solely on the probe's offline sweep (section 42).
+It has since been measured in training; see the re-run below.
 
 **The convergence region was never measured.** The screen capped at 25% and
 reached 12.6%, while `K = N` is the point where the optimizer is algebraically
@@ -1396,6 +1400,42 @@ Loss must return to the dense control at K/N = 1.0 — but by then TopK occupies
 1.89x the memory of the dense state it replaced. If quality only recovers past
 break-even, the method has no operating region at all, which is the structural
 form of this negative result.
+
+### Re-run of the v-only arm after the controller fix
+
+`experiments/vonly_rerun.jsonl`: the v-only arm on the fixed controller, the same
+budgets under `--fixed-k` (K pinned exactly, no controller), and a same-session
+dense control. Micro scale, 3,000 steps, seed 42, all on one GPU. The selftest
+gate passed first.
+
+| Config | K/N used | val loss | vs dense | state | reduction | tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| **AdamW dense (control)** | — | 2.2033 | — | 1.000 | 1.0x | 135,986 |
+| v-only dynamic, `K_max` = 1% | 1.00% | 2.2151 | +0.54% | 0.565 | 1.77x | 82,102 |
+| v-only dynamic, `K_max` = 5% | 5.00% | 2.2114 | +0.37% | 0.600 | 1.67x | 82,667 |
+| v-only dynamic, `K_max` = 10% | 10.00% | 2.2139 | +0.48% | 0.645 | 1.55x | 82,351 |
+| v-only fixed K = 1% | 1.00% | 2.2170 | +0.62% | 0.565 | 1.77x | 82,810 |
+| v-only fixed K = 5% | 5.00% | 2.2126 | +0.42% | 0.600 | 1.67x | 82,155 |
+| v-only fixed K = 10% | 10.00% | 2.2145 | +0.51% | 0.645 | 1.55x | 82,325 |
+
+1. **The fix works.** The dynamic controller now sits at its cap (cap-hit
+   0.997–0.999), so dynamic and fixed `K` are effectively the same runs — consistent
+   with `K_required/N` being far above any `K_max` tested.
+2. **Memory now moves with `K`, and only downward.** With `m` dense, the eligible
+   state is `(4 + 8·K/N) / 8` of dense, and 11.2% of state is non-eligible
+   (embeddings, head, norms). The ceiling as `K -> 0` is ~1.80x, so **v-only
+   cannot reach the 2x bar at any `K`**.
+3. **Quality is flat in `K`**, now measured in training: the six runs span
+   2.2114–2.2170 with no monotone trend. Single seed, so the spread cannot be
+   separated from seed noise; the two dense controls (screen and re-run) differ
+   by 0.0015 on identical settings.
+4. **TopK churn is very high once `K` is provisioned** — 0.89 / 0.96 / 0.97 at
+   1 / 5 / 10%, against ~0.07 in the under-provisioned screen runs — and quality
+   does not care. That fits AdamW's insensitivity to the second moment's
+   accuracy, given a floor.
+5. **Throughput −39%** against the same-session control. This GPU is slower than
+   the screen's (dense 136k vs 195k tok/s), so the percentage is not strictly
+   comparable with the screen's −44%; both are far outside the 10% gate.
 
 ### What would have to be true for this to work
 
