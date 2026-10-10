@@ -19,6 +19,7 @@ does not allocate).
 import csv
 import json
 import os
+import subprocess
 import time
 
 COLUMNS = [
@@ -92,3 +93,21 @@ def write_summary(path, blob):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     with open(path, 'w') as f:
         json.dump(blob, f, indent=2, sort_keys=False)
+
+
+def provenance():
+    """Which code produced a result: the git commit, and whether tracked files
+    differed from it. Every summary carries this, so a number in a report can be
+    traced to the exact implementation -- and results from different code are
+    never mixed by accident (`spectral_report.py` refuses to)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def git(*args):
+        try:
+            return subprocess.run(['git', *args], cwd=root, capture_output=True, text=True,
+                                  check=True).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    status = git('status', '--porcelain', '--untracked-files=no')
+    return {'commit': git('rev-parse', 'HEAD'), 'dirty': bool(status) if status is not None else None}

@@ -32,6 +32,7 @@ running at all.
 
 import argparse
 import csv
+import json
 import os
 import time
 from collections import defaultdict
@@ -43,6 +44,7 @@ from data import load_data, make_get_batch
 from model import build_model
 from spectral.metrics import (energy_profile, k_required, negative_v_stats, retained_energy,
                               spectral_entropy, state_error, update_fidelity)
+from spectral.telemetry import provenance
 from spectral.transforms import DCT2D
 from train_spectral import SCALES, build_param_groups
 
@@ -374,6 +376,9 @@ def main():
           f"{len(eligible)} eligible tensors | coverage {coverage:.1%}", flush=True)
 
     fid_path = os.path.join(out_dir, 'probe_fidelity.csv')
+    with open(os.path.join(out_dir, 'probe_meta.json'), 'w') as f:
+        json.dump({**vars(a), **provenance(), 'device': device,
+                   'gpu': torch.cuda.get_device_name() if device == 'cuda' else None}, f, indent=2)
     with open(csv_path, 'w', newline='') as f:
         csv.DictWriter(f, HEADER).writeheader()
     with open(fid_path, 'w', newline='') as f:

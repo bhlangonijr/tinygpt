@@ -49,7 +49,7 @@ import config as C
 from data import load_data, make_get_batch
 from model import build_model, save_checkpoint
 from spectral.optim import SpectralAdamW, SpectralConfig, SpectralSGD
-from spectral.telemetry import Telemetry, write_summary
+from spectral.telemetry import Telemetry, provenance, write_summary
 
 # ---------------- experiment defaults ----------------
 # Spectral knobs live here, not in config.py: only this experiment reads them
@@ -321,6 +321,7 @@ def main(argv=None):
         'name': name,
         'config': {**vars(a), 'lr': lr, 'min_lr': min_lr, 'device': device, 'bf16': use_amp,
                    'gpu': torch.cuda.get_device_name() if device == 'cuda' else None,
+                   **provenance(),
                    'spectral': cfg.dict(), 'scale_dims': scale},
         'model': {'params': n_params, 'spectral_coverage': coverage,
                   'vocab_size': d['vocab_size'], 'chars_per_token': chars_per_token},
@@ -365,6 +366,7 @@ def run_sweep(a):
             else:
                 argv += [flag, str(v)]
         name = row.get('name') or f"sweep{i}"
+        argv += ['--out', a.out]                 # children write where the skip check looks
         if os.path.exists(os.path.join(a.out, name, 'summary.json')):
             print(f"[{i}/{len(rows)}] {name}: already done, skipping")
             continue

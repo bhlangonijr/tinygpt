@@ -470,7 +470,9 @@ def test_training_precision():
     check("fp32 round trip at every training shape", worst['rt'] < 2e-6, f"max rel {worst['rt']:.2e}")
     check("fp32 Parseval at every training shape", worst['parseval'] < 1e-5,
           f"max rel {worst['parseval']:.2e}")
-    check("batched == separate, bit for bit", worst['batch'] == 0.0, f"max rel {worst['batch']:.2e}")
+    # cuFFT may pick a different algorithm for a batch: bit-identical on a GTX 1080 Ti,
+    # 5e-9 on an RTX 3060 Ti. Either is fp32 rounding, not a different transform.
+    check("batched == separate, to fp32 rounding", worst['batch'] < 1e-6, f"max rel {worst['batch']:.2e}")
 
     # K = N in fp32 against torch.optim.AdamW in fp32. Gradients are linear-layer
     # shaped (row x column scales) at a realistic magnitude.

@@ -5,11 +5,17 @@ Aggregate spectral runs into the experiment's result tables and plots.
     python spectral_report.py runs/                 # tables to stdout + report.md
     python spectral_report.py runs/ --plots         # also the section-32 figures
 
-Reads every `runs/*/summary.json` (plus its `telemetry.csv`) and emits the two
+Reads every `<root>/*/summary.json` (plus its `telemetry.csv`) and emits the two
 tables of spec section 38: the headline resource/quality table, and the
-diagnostic table of reconstruction and update fidelity. Quality deltas are
-computed against the DENSE run of the same optimizer, at the same scale and
-seed, so "1.2% worse" always means "worse than its own control".
+diagnostic table of reconstruction and update fidelity. Quality and throughput
+deltas are computed against the DENSE run of the same optimizer, at the same
+scale and seed, in the same root, so "1.2% worse" always means "worse than its
+own control". One root is one sweep: it must hold exactly one such control.
+
+Every table is stamped with the commit, tree state and GPU its runs came from,
+and the report refuses a root that mixes them (`--allow-mixed` overrides, and
+says so in the output): numbers from different implementations or hardware are
+not comparable, and a table that silently combined them would be wrong.
 
 The plot that matters most is the last one: `K_required/K_max` against update
 cosine similarity. That is the direct test of whether spectral saturation is a
@@ -83,11 +89,25 @@ def method_label(cfg):
         return f"{cfg['opt'].upper()} dense"
     bits = f"{cfg['opt'].upper()} {cfg['state'].upper()}-{cfg['select']}"
     bits += f" K{cfg['kmax_frac']:g}"
-    if cfg.get('fixed_k'):
-        bits += " fixedK"
+    bits += " fixedK" if cfg.get('fixed_k') else f" tau{cfg['tau']:g} R{cfg['refresh']}"
     if cfg.get('m_only'):
         bits += " m-only"
+    if cfg.get('v_only'):
+        bits += " v-only"
+    if cfg['opt'] == 'adamw':
+        bits += f" floor{cfg.get('v_floor', 0.0):g}"
+    if cfg.get('steps') != 3000:
+        bits += f" {cfg.get('steps')}steps"
     return bits
+
+
+def provenance_of(runs):
+    """{(commit, dirty, gpu): [run names]} -- one key means one implementation on one GPU."""
+    groups = defaultdict(list)
+    for r in runs:
+        c = r['config']
+        groups[(c.get('commit'), c.get('dirty'), c.get('gpu'))].append(r['name'])
+    return groups
 
 
 def fmt(x, spec='.3f', pct=False):
@@ -101,7 +121,11 @@ def build_tables(runs):
     for r in runs:
         c = r['config']
         if c['state'] == 'dense':
-            baselines[(c['opt'], c['scale'], c['seed'])] = r
+            key = (c['opt'], c['scale'], c['seed'])
+            if key in baselines:
+                sys.exit(f"two dense controls for {key} in one root "
+                         f"({baselines[key]['name']}, {r['name']}): one root is one sweep")
+            baselines[key] = r
 
     main_rows, diag_rows = [], []
     for r in runs:
@@ -110,8 +134,13 @@ def build_tables(runs):
         base = baselines.get((c['opt'], c['scale'], c['seed']))
         delta = ((q['final_val_loss'] - base['quality']['final_val_loss'])
                  / base['quality']['final_val_loss']) if base and base is not r else None
+        tok_delta = (r['timing']['tokens_per_sec'] / base['timing']['tokens_per_sec'] - 1
+                     if base and base is not r else None)
         beh = r.get('spectral_behaviour', {})
         main_rows.append({
+            'run': r['name'],
+            'tok_delta': tok_delta,
+            'profiled': bool(c.get('profile')),
             'method': method_label(c),
             'state_mib': mem.get('persistent_state_bytes', 0) / MIB,
             'ratio': mem.get('state_ratio'),
@@ -130,6 +159,7 @@ def build_tables(runs):
             continue
         m, v = tel.get('m', tel.get('momentum', {})), tel.get('v', {})
         diag_rows.append({
+            'run': r['name'],
             'method': method_label(c),
             'm_err': m.get('recon_error'),
             'v_err': v.get('recon_error'),
@@ -146,29 +176,44 @@ def build_tables(runs):
     return main_rows, diag_rows
 
 
-def render(main_rows, diag_rows):
+def render(main_rows, diag_rows, prov):
     out = []
+    out.append("## Provenance\n")
+    out.append("| Commit | Tree | GPU | Runs |")
+    out.append("| --- | --- | --- | ---: |")
+    for (commit, dirty, gpu), names in sorted(prov.items(), key=lambda kv: str(kv[0])):
+        tree = {True: 'DIRTY', False: 'clean', None: 'unknown'}[dirty]
+        out.append(f"| `{(commit or 'unrecorded')[:12]}` | {tree} | {gpu or 'unrecorded'} | {len(names)} |")
+    if len(prov) > 1:
+        out.append("\n**WARNING: this root mixes implementations or GPUs (`--allow-mixed`); "
+                   "rows from different provenance are NOT comparable.**")
+    out.append("")
     out.append("## Resources and quality (spec section 38)\n")
-    out.append("| Method | State MiB | vs dense | Peak MiB | K/N avg | Cap hit | tok/s | "
-               "Val loss | PPL | BPC | dVal | NaN |")
-    out.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    out.append("| Run | Method | State MiB | vs dense | Peak MiB | K/N avg | Cap hit | tok/s | "
+               "d tok/s | Val loss | PPL | BPC | dVal | NaN |")
+    out.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for r in main_rows:
         mark = '' if r['valid_mem'] else ' (i)'
+        mark += ' (p)' if r['profiled'] else ''
         out.append(
-            f"| {r['method']}{mark} | {r['state_mib']:.2f} | {fmt(r['ratio'])} | "
+            f"| {r['run']} | {r['method']}{mark} | {r['state_mib']:.2f} | {fmt(r['ratio'])} | "
             f"{r['peak_mib']:.0f} | {fmt(r['k_over_n'], '.2f', pct=True)} | "
-            f"{fmt(r['cap_hit'], '.0f', pct=True)} | {r['tok_s']:.0f} | {r['val']:.4f} | "
-            f"{r['ppl']:.2f} | {r['bpc']:.3f} | {fmt(r['delta'], '.2f', pct=True)} | {r['nan']} |")
+            f"{fmt(r['cap_hit'], '.0f', pct=True)} | {r['tok_s']:.0f} | "
+            f"{fmt(r['tok_delta'], '+.1f', pct=True)} | {r['val']:.4f} | "
+            f"{r['ppl']:.2f} | {r['bpc']:.3f} | {fmt(r['delta'], '+.2f', pct=True)} | {r['nan']} |")
     out.append("\n`(i)` = instrumented run: shadow dense states are allocated for measurement, "
-               "so its memory columns are NOT a valid benchmark.\n")
+               "so its memory and throughput columns are NOT a valid benchmark. "
+               "`(p)` = sampled phase timing on (synchronizes): throughput is not comparable. "
+               "`K/N avg` and `Cap hit` are the final K and the cap-hit rate, meaned over "
+               "spectral states.\n")
 
     out.append("\n## Fidelity diagnostics (spec section 38, second table)\n")
-    out.append("| Method | m error | v error | Update cos | Rel norm | Entropy | K_req/K_max | "
+    out.append("| Run | m error | v error | Update cos | Rel norm | Entropy | K_req/K_max | "
                "v clamp | neg-v energy | Churn | Proxy/oracle | Saturation r |")
     out.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for r in diag_rows:
         out.append(
-            f"| {r['method']} | {fmt(r['m_err'], '.4f')} | {fmt(r['v_err'], '.4f')} | "
+            f"| {r['run']} | {fmt(r['m_err'], '.4f')} | {fmt(r['v_err'], '.4f')} | "
             f"{fmt(r['cos'], '.4f')} | {fmt(r['rel_norm'], '.3f')} | {fmt(r['entropy'], '.3f')} | "
             f"{fmt(r['k_req_kmax'], '.2f')} | {fmt(r['v_clamp'], '.1f', pct=True)} | "
             f"{fmt(r['neg_v'], '.4f')} | {fmt(r['churn'], '.3f')} | {fmt(r['proxy'], '.2f')} | "
@@ -250,13 +295,24 @@ def main():
     ap.add_argument('root', nargs='?', default='runs')
     ap.add_argument('--plots', action='store_true')
     ap.add_argument('--out', default=None, help='markdown output (default <root>/report.md)')
+    ap.add_argument('--allow-mixed', action='store_true',
+                    help='report a root that mixes commits / dirty trees / GPUs (flagged in output)')
     a = ap.parse_args()
 
     runs = load_runs(a.root)
     if not runs:
         print(f"no summary.json found under {a.root}", file=sys.stderr)
         sys.exit(1)
-    md = render(*build_tables(runs))
+    prov = provenance_of(runs)
+    if not a.allow_mixed:
+        if len(prov) > 1:
+            sys.exit(f"{a.root} mixes provenance {sorted(map(str, prov))}; "
+                     f"rerun on one commit/GPU or pass --allow-mixed")
+        (commit, dirty, gpu), = prov
+        if commit is None or dirty is not False:
+            sys.exit(f"{a.root}: runs have no recorded commit or came from a dirty tree; "
+                     f"pass --allow-mixed to report them anyway")
+    md = render(*build_tables(runs), prov)
     print(md)
     out = a.out or os.path.join(a.root, 'report.md')
     with open(out, 'w') as f:

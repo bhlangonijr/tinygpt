@@ -1492,7 +1492,8 @@ cached twiddles with the scale folded in, a gather for the even extension,
 transforms along any axis (no transposes), implicit zero padding in `irfft`, and
 one batched call for `g` and `g^2` (and for reconstructing `m` and `v`). Now
 ~140 / ~180 µs per matrix, same accuracy (fp32 4e-7, fp64 1e-13 against the
-matrix DCT; batched equals separate bit for bit). Training throughput cost of
+matrix DCT; batched equals separate to fp32 rounding — bit for bit on a GTX
+1080 Ti, 5e-9 on an RTX 3060 Ti). Training throughput cost of
 m+v went from −61% to −28% against a same-sweep dense control.
 
 **Defect 3 — evaluation shared the training batch RNG.** Each evaluation drew
